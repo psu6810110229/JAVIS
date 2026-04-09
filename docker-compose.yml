@@ -1,0 +1,15 @@
+services:
+  jarvis-backend:
+    build:
+      context: ./jarvis-backend
+      dockerfile: Dockerfile
+    container_name: jarvis-backend
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      JARVIS_MODEL_NAME: ${JARVIS_MODEL_NAME:-gemini-1.5-pro}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./jarvis-backend:/app
+    restart: unless-stopped
