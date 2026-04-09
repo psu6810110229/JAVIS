@@ -9,7 +9,7 @@ from uuid import uuid4
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field, ValidationError
 
-from .brain import JarvisBrain
+from .brain import AudioProcessingError, JarvisBrain
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,7 +17,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Jarvis Backend", version="0.1.0")
+app = FastAPI(title="Jarvis Backend", version="0.2.0")
 brain = JarvisBrain()
 
 
@@ -51,6 +51,43 @@ def build_envelope(
         "timestamp": utc_timestamp(),
         "session_id": session_id,
     }
+
+
+async def send_assistant_response(
+    websocket: WebSocket,
+    session_id: str,
+    response_text: str,
+    tool_schemas: list[dict[str, Any]],
+    assistant_audio: dict[str, Any] | None,
+    audio_error: str | None,
+) -> None:
+    await websocket.send_json(
+        build_envelope(
+            event_type="text.output",
+            payload={
+                "text": response_text,
+                "tool_schemas": tool_schemas,
+            },
+            session_id=session_id,
+        )
+    )
+
+    if assistant_audio is not None:
+        await websocket.send_json(
+            build_envelope(
+                event_type="assistant_audio",
+                payload=assistant_audio,
+                session_id=session_id,
+            )
+        )
+    elif audio_error is not None:
+        await websocket.send_json(
+            build_envelope(
+                event_type="error",
+                payload={"message": audio_error},
+                session_id=session_id,
+            )
+        )
 
 
 @app.on_event("startup")
@@ -150,21 +187,20 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 )
 
                 reply = await brain.handle_text(session_id=session_id, user_text=payload.text)
-                await websocket.send_json(
-                    build_envelope(
-                        event_type="text.output",
-                        payload={
-                            "text": reply.text,
-                            "tool_schemas": [schema.model_dump() for schema in reply.tool_schemas],
-                        },
-                        session_id=session_id,
-                    )
+                await send_assistant_response(
+                    websocket=websocket,
+                    session_id=session_id,
+                    response_text=reply.text,
+                    tool_schemas=[schema.model_dump() for schema in reply.tool_schemas],
+                    assistant_audio=reply.assistant_audio.model_dump() if reply.assistant_audio else None,
+                    audio_error=reply.audio_error,
                 )
                 continue
 
             if envelope.type == "audio.chunk":
                 try:
                     audio_payload = brain.parse_audio_payload(envelope.payload)
+                    result = await brain.handle_audio_chunk(session_id=session_id, payload=audio_payload)
                 except ValueError as error:
                     logger.warning("Invalid audio payload received: %s", error)
                     await websocket.send_json(
@@ -175,14 +211,40 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         )
                     )
                     continue
+                except AudioProcessingError as error:
+                    logger.warning("Audio processing failed for session '%s': %s", session_id, error)
+                    await websocket.send_json(
+                        build_envelope(
+                            event_type="error",
+                            payload={"message": str(error)},
+                            session_id=session_id,
+                        )
+                    )
+                    continue
 
-                acknowledgement = await brain.handle_audio_chunk(audio_payload)
                 await websocket.send_json(
                     build_envelope(
                         event_type="audio.ack",
-                        payload=acknowledgement.model_dump(),
+                        payload=result.acknowledgement.model_dump(),
                         session_id=session_id,
                     )
+                )
+                await websocket.send_json(
+                    build_envelope(
+                        event_type="speech.transcript",
+                        payload=result.transcript.model_dump(),
+                        session_id=session_id,
+                    )
+                )
+                await send_assistant_response(
+                    websocket=websocket,
+                    session_id=session_id,
+                    response_text=result.response.text,
+                    tool_schemas=[schema.model_dump() for schema in result.response.tool_schemas],
+                    assistant_audio=result.response.assistant_audio.model_dump()
+                    if result.response.assistant_audio
+                    else None,
+                    audio_error=result.response.audio_error,
                 )
                 continue
 
