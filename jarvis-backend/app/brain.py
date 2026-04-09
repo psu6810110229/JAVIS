@@ -13,7 +13,10 @@ import google.generativeai as genai
 from google.api_core.exceptions import GoogleAPIError
 from pydantic import BaseModel, Field, ValidationError
 
+from .config import load_project_env
+
 logger = logging.getLogger(__name__)
+DEFAULT_GEMINI_MODEL_NAME = "gemini-1.5-flash"
 
 
 class ToolSchema(BaseModel):
@@ -41,7 +44,8 @@ class AudioChunkPayload(BaseModel):
 
 class JarvisBrain:
     def __init__(self, model_name: str | None = None) -> None:
-        self._model_name = model_name or os.getenv("JARVIS_MODEL_NAME", "gemini-1.5-pro")
+        load_project_env()
+        self._model_name = model_name or os.getenv("JARVIS_MODEL_NAME", DEFAULT_GEMINI_MODEL_NAME)
         self._system_instruction = (
             "You are Jarvis, a modern voice-first AI assistant. "
             "Respond with concise, helpful, production-minded answers. "
@@ -131,7 +135,7 @@ class JarvisBrain:
 
         if chat_session is None:
             return BrainResponse(
-                text="Gemini is not configured yet. Set GEMINI_API_KEY to enable live model responses.",
+                text="Gemini is not configured yet. Add GEMINI_API_KEY to the root .env file or container environment, then restart the backend.",
                 tool_schemas=self.tool_schemas,
             )
 
