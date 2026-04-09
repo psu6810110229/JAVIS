@@ -76,6 +76,8 @@ function App() {
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [isPlayingAudio, setIsPlayingAudio] = useState<boolean>(false);
   const [micError, setMicError] = useState<string>("");
+  const [audioUiError, setAudioUiError] = useState<string>("");
+  const [sttUiError, setSttUiError] = useState<string>("");
   const socketRef = useRef<WebSocket | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -83,6 +85,12 @@ function App() {
   const shouldSendRecordingRef = useRef<boolean>(true);
   const activeAudioRef = useRef<HTMLAudioElement | null>(null);
   const activeAudioUrlRef = useRef<string>("");
+  const activeAudioTokenRef = useRef<number>(0);
+  const audioLoadConfirmedRef = useRef<boolean>(false);
+  const audioPlaybackErroredRef = useRef<boolean>(false);
+  const audioErrorTimeoutRef = useRef<number | null>(null);
+  const audioUiHideTimeoutRef = useRef<number | null>(null);
+  const sttUiHideTimeoutRef = useRef<number | null>(null);
   const wsUrl = import.meta.env.VITE_JARVIS_WS_URL ?? DEFAULT_WS_URL;
   const mediaRecorderSupported =
     typeof window !== "undefined" &&
@@ -94,6 +102,8 @@ function App() {
   useEffect(() => {
     return () => {
       stopRecording(true);
+      clearAudioUiHideTimeout();
+      clearSttUiHideTimeout();
       cleanupAudioPlayback();
       socketRef.current?.close();
     };
@@ -108,8 +118,79 @@ function App() {
     streamRef.current = null;
   }
 
+  function clearAudioUiHideTimeout(): void {
+    if (audioUiHideTimeoutRef.current !== null) {
+      window.clearTimeout(audioUiHideTimeoutRef.current);
+      audioUiHideTimeoutRef.current = null;
+    }
+  }
+
+  function clearSttUiHideTimeout(): void {
+    if (sttUiHideTimeoutRef.current !== null) {
+      window.clearTimeout(sttUiHideTimeoutRef.current);
+      sttUiHideTimeoutRef.current = null;
+    }
+  }
+
+  function showAudioUiError(content: string): void {
+    clearAudioUiHideTimeout();
+    setAudioUiError(content);
+    audioUiHideTimeoutRef.current = window.setTimeout(() => {
+      setAudioUiError("");
+      audioUiHideTimeoutRef.current = null;
+    }, 3000);
+  }
+
+  function clearAudioUiError(): void {
+    clearAudioUiHideTimeout();
+    setAudioUiError("");
+  }
+
+  function showSttUiError(content: string): void {
+    clearSttUiHideTimeout();
+    setSttUiError(content);
+    sttUiHideTimeoutRef.current = window.setTimeout(() => {
+      setSttUiError("");
+      sttUiHideTimeoutRef.current = null;
+    }, 3000);
+  }
+
+  function clearSttUiError(): void {
+    clearSttUiHideTimeout();
+    setSttUiError("");
+  }
+
+  function clearAudioErrorTimeout(): void {
+    if (audioErrorTimeoutRef.current !== null) {
+      window.clearTimeout(audioErrorTimeoutRef.current);
+      audioErrorTimeoutRef.current = null;
+    }
+  }
+
+  function scheduleAudioError(content: string, token: number, delayMs: number = 2000): void {
+    clearAudioErrorTimeout();
+    audioErrorTimeoutRef.current = window.setTimeout(() => {
+      if (token !== activeAudioTokenRef.current || audioLoadConfirmedRef.current) {
+        return;
+      }
+
+      audioPlaybackErroredRef.current = true;
+      showAudioUiError(content);
+      cleanupAudioPlayback();
+    }, delayMs);
+  }
+
   function cleanupAudioPlayback(): void {
+    clearAudioErrorTimeout();
+    activeAudioTokenRef.current += 1;
+    audioLoadConfirmedRef.current = false;
+    audioPlaybackErroredRef.current = false;
+
     if (activeAudioRef.current) {
+      activeAudioRef.current.onended = null;
+      activeAudioRef.current.onerror = null;
+      activeAudioRef.current.oncanplaythrough = null;
+      activeAudioRef.current.onloadeddata = null;
       activeAudioRef.current.pause();
       activeAudioRef.current.src = "";
       activeAudioRef.current = null;
@@ -127,39 +208,57 @@ function App() {
     cleanupAudioPlayback();
 
     try {
+      const playbackToken = activeAudioTokenRef.current;
       const audioBlob = base64ToBlob(payload.audio_base64, payload.mime_type);
       const audioUrl = URL.createObjectURL(audioBlob);
       const audio = new Audio(audioUrl);
 
       activeAudioRef.current = audio;
       activeAudioUrlRef.current = audioUrl;
+      audioLoadConfirmedRef.current = false;
+      audioPlaybackErroredRef.current = false;
       setIsPlayingAudio(true);
 
+      const markLoaded = () => {
+        if (playbackToken !== activeAudioTokenRef.current) {
+          return;
+        }
+        audioLoadConfirmedRef.current = true;
+        audioPlaybackErroredRef.current = false;
+        clearAudioErrorTimeout();
+        clearAudioUiError();
+      };
+
+      audio.onloadeddata = markLoaded;
+      audio.oncanplaythrough = markLoaded;
+      audio.onplay = markLoaded;
+
       audio.onended = () => {
+        if (playbackToken !== activeAudioTokenRef.current) {
+          return;
+        }
         cleanupAudioPlayback();
       };
       audio.onerror = () => {
-        cleanupAudioPlayback();
-        pushMessage({
-          id: `audio-playback-error-${Date.now()}`,
-          role: "system",
-          label: "Audio",
-          content: "Jarvis could not play the assistant audio reply."
-        });
+        if (playbackToken !== activeAudioTokenRef.current || audioLoadConfirmedRef.current) {
+          return;
+        }
+
+        scheduleAudioError("Jarvis could not play the assistant audio reply.", playbackToken);
       };
 
       await audio.play();
+      markLoaded();
     } catch (error: unknown) {
+      const isAbortError = error instanceof DOMException && error.name === "AbortError";
+      if (isAbortError) {
+        return;
+      }
+
       cleanupAudioPlayback();
-      pushMessage({
-        id: `audio-playback-exception-${Date.now()}`,
-        role: "system",
-        label: "Audio",
-        content:
-          error instanceof Error
-            ? error.message
-            : "Jarvis encountered an unexpected audio playback error."
-      });
+      showAudioUiError(
+        error instanceof Error ? error.message : "Jarvis encountered an unexpected audio playback error."
+      );
     }
   }
 
@@ -212,6 +311,7 @@ function App() {
       if (data.type === "speech.transcript") {
         const transcriptText = typeof data.payload.text === "string" ? data.payload.text : "";
         if (transcriptText) {
+          clearSttUiError();
           pushMessage({
             id: `transcript-${Date.now()}`,
             role: "user",
@@ -229,16 +329,34 @@ function App() {
           typeof payload.mime_type === "string" &&
           typeof payload.voice === "string"
         ) {
+          clearSttUiError();
           void playAssistantAudio(payload as AssistantAudioPayload);
         } else {
-          pushMessage({
-            id: `assistant-audio-invalid-${Date.now()}`,
-            role: "system",
-            label: "Audio",
-            content: "Jarvis returned an invalid assistant audio payload."
-          });
+          showAudioUiError("Jarvis returned an invalid assistant audio payload.");
         }
         return;
+      }
+
+      if (data.type === "text.output") {
+        const textOut = typeof data.payload.text === "string" ? data.payload.text.trim() : "";
+        if (textOut.length > 0) {
+          clearSttUiError();
+        }
+      }
+
+      if (data.type === "error") {
+        const errorMessage = typeof data.payload.message === "string" ? data.payload.message : "";
+        const normalized = errorMessage.toLowerCase();
+        const isSttError =
+          normalized.includes("could not understand") ||
+          normalized.includes("stt") ||
+          normalized.includes("spoken text") ||
+          normalized.includes("recorded thai speech");
+
+        if (isSttError) {
+          showSttUiError(errorMessage || "Jarvis could not understand the recorded speech.");
+          return;
+        }
       }
 
       const payloadText =
@@ -463,12 +581,12 @@ function App() {
       >
         <header className="flex flex-col gap-4 border-b border-white/10 pb-6 md:flex-row md:items-end md:justify-between">
           <div className="space-y-3">
-            <p className="text-sm uppercase tracking-[0.35em] text-accent/80">Voice AI Assistant</p>
+            <p className="text-sm uppercase tracking-[0.35em] text-accent/80">Local Voice AI Assistant</p>
             <div>
               <h1 className="text-4xl font-semibold tracking-tight sm:text-5xl">Jarvis</h1>
               <p className="mt-2 max-w-2xl text-sm text-slate-300 sm:text-base">
-                Phase 2 adds push-to-talk voice input, Thai speech synthesis, and native audio playback
-                over the existing FastAPI WebSocket session.
+                Phase 3.1 keeps voice I/O and runs the conversational brain on local Ollama for privacy and
+                rate-limit-free responses.
               </p>
             </div>
           </div>
@@ -517,6 +635,21 @@ function App() {
                 Session {sessionId || "pending"}
               </span>
             </div>
+
+            {(audioUiError || sttUiError) && (
+              <div className="mb-3 space-y-2">
+                {audioUiError && (
+                  <div className="rounded-2xl border border-amber-300/30 bg-amber-500/10 px-4 py-2 text-sm text-amber-100">
+                    {audioUiError}
+                  </div>
+                )}
+                {sttUiError && (
+                  <div className="rounded-2xl border border-rose-300/30 bg-rose-500/10 px-4 py-2 text-sm text-rose-100">
+                    {sttUiError}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className="flex-1 space-y-3 overflow-y-auto pr-2">
               {messages.map((message) => (
@@ -616,7 +749,7 @@ function App() {
               <p className="text-xs uppercase tracking-[0.28em] text-accent/80">Voice Loop</p>
               <p className="mt-3 text-sm leading-6 text-slate-300">
                 The frontend records one WebM utterance at a time, the backend transcribes Thai speech,
-                queries Gemini, and returns both assistant text and Thai TTS audio.
+                queries local Ollama, and returns both assistant text and Thai TTS audio.
               </p>
             </div>
           </aside>

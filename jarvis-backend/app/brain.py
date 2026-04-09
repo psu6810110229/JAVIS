@@ -5,25 +5,23 @@ import base64
 import binascii
 import io
 import logging
-import os
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import edge_tts
-import google.generativeai as genai
+import httpx
 import speech_recognition as sr
-from aiohttp import ClientError
-from google.api_core.exceptions import GoogleAPIError
 from pydantic import BaseModel, Field, ValidationError
 from pydub import AudioSegment
 from pydub.exceptions import CouldntDecodeError
 
 from .config import load_project_env
+from .tts_engine import ElevenLabsTtsEngine, TtsEngineError
 
 logger = logging.getLogger(__name__)
-DEFAULT_GEMINI_MODEL_NAME = "gemini-1.5-flash"
-DEFAULT_THAI_TTS_VOICE = "th-TH-PremwadeeNeural"
+DEFAULT_OLLAMA_MODEL_NAME = "scb10x/typhoon2.5-qwen3-4b"
+DEFAULT_OLLAMA_BASE_URL = "http://ollama:11434"
+DEFAULT_OLLAMA_TIMEOUT_SECONDS = 60.0
 DEFAULT_STT_LANGUAGE = "th-TH"
 
 
@@ -77,21 +75,26 @@ class VoiceInteractionResult(BaseModel):
 class JarvisBrain:
     def __init__(self, model_name: str | None = None) -> None:
         load_project_env()
-        self._model_name = model_name or os.getenv("JARVIS_MODEL_NAME", DEFAULT_GEMINI_MODEL_NAME)
-        self._tts_voice = DEFAULT_THAI_TTS_VOICE
+        self._model_name = DEFAULT_OLLAMA_MODEL_NAME
+        self._ollama_base_url = DEFAULT_OLLAMA_BASE_URL
+        self._ollama_timeout = DEFAULT_OLLAMA_TIMEOUT_SECONDS
+        self._tts_engine = ElevenLabsTtsEngine()
+        self._tts_voice = self._tts_engine.voice_label
         self._stt_language = DEFAULT_STT_LANGUAGE
         self._system_instruction = (
-            "You are Jarvis, a modern voice-first AI assistant. "
-            "Respond with concise, helpful, production-minded answers. "
-            "Use tools when they are clearly needed, and keep the conversation grounded in the user's request."
+            "คุณคือ Jarvis (จาร์วิส) เอไอผู้ช่วยส่วนตัวที่ชาญฉลาดและซื่อสัตย์ "
+            "คุณต้องเรียกผู้ใช้ว่า 'Sir' (เซอร์) หรือ 'คุณ Fran' เสมอ (ห้ามเรียกว่า สิริ) "
+            "การตอบต้องกระชับ มีไหวพริบ และมีความเป็นมืออาชีพ "
+            "ต้องลงท้ายประโยคด้วยคำว่า 'ครับ' ทุกครั้งเพื่อให้ดูสุภาพ "
+            "สื่อสารด้วยภาษาไทยที่เข้าใจง่ายและเป็นธรรมชาติ"
         )
-        self._model: genai.GenerativeModel | None = None
-        self._sessions: dict[str, Any] = {}
+        self._sessions: dict[str, list[dict[str, str]] | None] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._initialization_lock = asyncio.Lock()
         self._initialized = False
+        self._ollama_available = False
+        self._initialization_error: str | None = None
         self._tool_schemas = self._build_tool_schemas()
-        self._tools = [self._get_current_datetime, self._get_backend_status]
 
     @property
     def tool_schemas(self) -> list[ToolSchema]:
@@ -105,27 +108,26 @@ class JarvisBrain:
             if self._initialized:
                 return
 
-            api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-            if not api_key:
-                logger.warning("Gemini API key is not configured; JarvisBrain will run in degraded mode.")
-                self._initialized = True
-                return
-
             try:
-                await asyncio.to_thread(genai.configure, api_key=api_key)
-                self._model = await asyncio.to_thread(
-                    self._create_model,
-                    self._model_name,
-                    self._system_instruction,
-                    self._tools,
-                )
-            except (GoogleAPIError, RuntimeError, TypeError, ValueError) as error:
+                self._ollama_available, self._initialization_error = await self._check_ollama_health()
+            except (RuntimeError, TypeError, ValueError) as error:
+                self._ollama_available = False
+                self._initialization_error = str(error)
                 logger.exception("JarvisBrain initialization failed: %s", error)
-                self._model = None
 
             self._initialized = True
-            if self._model is not None:
-                logger.info("JarvisBrain initialized with model '%s'.", self._model_name)
+            if self._ollama_available:
+                logger.info(
+                    "JarvisBrain initialized with Ollama model '%s' at '%s'.",
+                    self._model_name,
+                    self._ollama_base_url,
+                )
+            else:
+                logger.warning(
+                    "JarvisBrain running in degraded mode. Ollama unavailable at '%s': %s",
+                    self._ollama_base_url,
+                    self._initialization_error or "unknown reason",
+                )
 
     async def create_session(self, session_id: str) -> None:
         await self.initialize()
@@ -134,22 +136,12 @@ class JarvisBrain:
 
         self._session_locks[session_id] = asyncio.Lock()
 
-        if self._model is None:
-            self._sessions[session_id] = None
-            return
-
-        try:
-            chat_session = await asyncio.to_thread(
-                self._model.start_chat,
-                history=[],
-                enable_automatic_function_calling=True,
-            )
-        except (GoogleAPIError, RuntimeError, TypeError, ValueError) as error:
-            logger.exception("Could not create Jarvis session '%s': %s", session_id, error)
-            self._sessions[session_id] = None
-            return
-
-        self._sessions[session_id] = chat_session
+        self._sessions[session_id] = [
+            {
+                "role": "system",
+                "content": self._system_instruction,
+            }
+        ]
         logger.info("Created Jarvis session '%s'.", session_id)
 
     async def close_session(self, session_id: str) -> None:
@@ -165,38 +157,58 @@ class JarvisBrain:
             )
 
         await self.create_session(session_id)
-        chat_session = self._sessions.get(session_id)
+        messages = self._sessions.get(session_id)
 
-        if chat_session is None:
+        if messages is None:
             return BrainResponse(
-                text="Gemini is not configured yet. Add GEMINI_API_KEY to the root .env file or container environment, then restart the backend.",
+                text="Jarvis session state is unavailable. Please restart the session.",
                 tool_schemas=self.tool_schemas,
             )
 
         session_lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         async with session_lock:
+            messages.append({"role": "user", "content": user_text})
             try:
-                response = await asyncio.to_thread(chat_session.send_message, user_text)
-            except GoogleAPIError as error:
-                logger.exception("Gemini API request failed for session '%s'.", session_id)
+                response_text = await self._generate_ollama_response(messages)
+                messages.append({"role": "assistant", "content": response_text})
+                self._ollama_available = True
+                self._initialization_error = None
+            except OllamaUnavailableError as error:
+                logger.exception("Ollama unavailable for session '%s'.", session_id)
+                self._ollama_available = False
+                self._initialization_error = str(error)
+                messages.pop()
                 return BrainResponse(
-                    text=f"Jarvis could not reach Gemini: {str(error)}",
+                    text=f"Jarvis could not reach local Ollama at {self._ollama_base_url}: {error}",
                     tool_schemas=self.tool_schemas,
                 )
-            except (TypeError, ValueError) as error:
-                logger.exception("Gemini request payload failed for session '%s'.", session_id)
+            except OllamaModelError as error:
+                logger.exception("Ollama model error for session '%s'.", session_id)
+                messages.pop()
                 return BrainResponse(
-                    text=f"Jarvis could not process the request payload: {error}",
+                    text=(
+                        f"Jarvis local model '{self._model_name}' is not ready. "
+                        f"Run 'ollama pull {self._model_name}' and retry. "
+                        f"Details: {error}"
+                    ),
+                    tool_schemas=self.tool_schemas,
+                )
+            except OllamaResponseError as error:
+                logger.exception("Ollama response parse failed for session '%s'.", session_id)
+                messages.pop()
+                return BrainResponse(
+                    text=f"Jarvis received an invalid response from Ollama: {error}",
                     tool_schemas=self.tool_schemas,
                 )
             except RuntimeError as error:
                 logger.exception("Chat session failed for session '%s'.", session_id)
+                messages.pop()
                 return BrainResponse(
                     text=f"Jarvis encountered a runtime error while processing your message: {error}",
                     tool_schemas=self.tool_schemas,
                 )
 
-        response_text = getattr(response, "text", "") or "Jarvis completed the request without a text response."
+        response_text = response_text or "Jarvis completed the request without a text response."
 
         assistant_audio: AssistantAudioPayload | None = None
         audio_error: str | None = None
@@ -212,6 +224,92 @@ class JarvisBrain:
             assistant_audio=assistant_audio,
             audio_error=audio_error,
         )
+
+    async def _check_ollama_health(self) -> tuple[bool, str | None]:
+        try:
+            timeout = httpx.Timeout(self._ollama_timeout)
+            async with httpx.AsyncClient(base_url=self._ollama_base_url, timeout=timeout) as client:
+                response = await client.get("/api/tags")
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as error:
+            return False, f"unable to connect ({error})"
+        except httpx.HTTPError as error:
+            return False, f"HTTP error ({error})"
+
+        if response.status_code >= 400:
+            return False, f"HTTP {response.status_code}"
+
+        try:
+            payload = response.json()
+        except ValueError as error:
+            return False, f"invalid health payload ({error})"
+
+        models = payload.get("models")
+        if not isinstance(models, list):
+            return False, "missing model list in /api/tags response"
+
+        model_name_matches = any(
+            isinstance(model, dict)
+            and isinstance(model.get("name"), str)
+            and model.get("name", "").split(":", 1)[0] == self._model_name
+            for model in models
+        )
+        if not model_name_matches and models:
+            logger.warning(
+                "Configured model '%s' not currently listed in Ollama tags. It may need to be pulled.",
+                self._model_name,
+            )
+
+        return True, None
+
+    async def _generate_ollama_response(self, messages: list[dict[str, str]]) -> str:
+        request_payload = {
+            "model": self._model_name,
+            "messages": messages,
+            "stream": False,
+        }
+
+        try:
+            timeout = httpx.Timeout(self._ollama_timeout)
+            async with httpx.AsyncClient(base_url=self._ollama_base_url, timeout=timeout) as client:
+                response = await client.post("/api/chat", json=request_payload)
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as error:
+            raise OllamaUnavailableError(str(error)) from error
+        except httpx.HTTPError as error:
+            raise OllamaUnavailableError(str(error)) from error
+
+        if response.status_code >= 400:
+            detail = response.text.strip() or f"HTTP {response.status_code}"
+            if response.status_code in (400, 404):
+                lower_detail = detail.lower()
+                if "model" in lower_detail and ("not found" in lower_detail or "missing" in lower_detail):
+                    raise OllamaModelError(detail)
+            raise OllamaUnavailableError(detail)
+
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise OllamaResponseError(f"invalid JSON payload ({error})") from error
+
+        payload_error = payload.get("error")
+        if isinstance(payload_error, str) and payload_error.strip():
+            lower_error = payload_error.lower()
+            if "model" in lower_error and ("not found" in lower_error or "missing" in lower_error):
+                raise OllamaModelError(payload_error)
+            raise OllamaUnavailableError(payload_error)
+
+        message_payload = payload.get("message")
+        if not isinstance(message_payload, dict):
+            raise OllamaResponseError("missing message object")
+
+        content = message_payload.get("content")
+        if not isinstance(content, str):
+            raise OllamaResponseError("missing assistant message content")
+
+        cleaned_content = content.strip()
+        if not cleaned_content:
+            raise OllamaResponseError("assistant message content is empty")
+
+        return cleaned_content
 
     async def handle_audio_chunk(
         self,
@@ -283,37 +381,15 @@ class JarvisBrain:
         return cleaned_transcript
 
     async def _synthesize_assistant_audio(self, text: str) -> AssistantAudioPayload:
-        communicate = edge_tts.Communicate(text=text, voice=self._tts_voice)
-        audio_bytes = bytearray()
-
         try:
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    audio_data = chunk.get("data")
-                    if isinstance(audio_data, (bytes, bytearray)):
-                        audio_bytes.extend(audio_data)
-        except (ClientError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
-            raise AudioProcessingError("Jarvis could not generate Thai speech output.") from error
-
-        if not audio_bytes:
-            raise AudioProcessingError("Jarvis TTS returned no audio data.")
+            synthesized = await self._tts_engine.synthesize(text)
+        except TtsEngineError as error:
+            raise AudioProcessingError(str(error)) from error
 
         return AssistantAudioPayload(
-            audio_base64=base64.b64encode(bytes(audio_bytes)).decode("utf-8"),
-            mime_type="audio/mpeg",
-            voice=self._tts_voice,
-        )
-
-    @staticmethod
-    def _create_model(
-        model_name: str,
-        system_instruction: str,
-        tools: list[Any],
-    ) -> genai.GenerativeModel:
-        return genai.GenerativeModel(
-            model_name=model_name,
-            tools=tools,
-            system_instruction=system_instruction,
+            audio_base64=synthesized.audio_base64,
+            mime_type=synthesized.mime_type,
+            voice=synthesized.voice,
         )
 
     @staticmethod
@@ -363,10 +439,11 @@ class JarvisBrain:
         return {
             "service": "jarvis-backend",
             "model_name": self._model_name,
-            "gemini_configured": str(self._model is not None).lower(),
+            "ollama_base_url": self._ollama_base_url,
+            "ollama_configured": str(self._ollama_available).lower(),
             "tts_voice": self._tts_voice,
             "stt_language": self._stt_language,
-            "status": "ready" if self._model is not None else "degraded",
+            "status": "ready" if self._ollama_available else "degraded",
         }
 
     @staticmethod
@@ -375,3 +452,15 @@ class JarvisBrain:
             return AudioChunkPayload.model_validate(raw_payload)
         except ValidationError as error:
             raise ValueError("Invalid audio payload.") from error
+
+
+class OllamaUnavailableError(Exception):
+    """Raised when the Ollama runtime cannot be reached or returns service errors."""
+
+
+class OllamaModelError(Exception):
+    """Raised when the configured model is missing from Ollama."""
+
+
+class OllamaResponseError(Exception):
+    """Raised when Ollama response payload does not contain expected fields."""

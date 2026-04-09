@@ -1,15 +1,29 @@
 services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
   jarvis-backend:
     build:
       context: ./jarvis-backend
       dockerfile: Dockerfile
     container_name: jarvis-backend
+    depends_on:
+      - ollama
     environment:
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
-      JARVIS_MODEL_NAME: ${JARVIS_MODEL_NAME:-}
+      JARVIS_MODEL_NAME: scb10x/typhoon2.5-qwen3-4b
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      ELEVENLABS_API_KEY: sk_01090178dd5dc2fabc1881d94bf6dc2483d760dab3a61074
     ports:
       - "8000:8000"
     volumes:
       - ./jarvis-backend:/app
     restart: unless-stopped
+
+volumes:
+  ollama_data:
