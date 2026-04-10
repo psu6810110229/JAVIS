@@ -24,10 +24,10 @@ from .config import SystemConfig, load_project_env
 from .tts_engine import KokoroTtsEngine, TtsEngineError
 
 logger = logging.getLogger(__name__)
-DEFAULT_OLLAMA_MODEL_NAME = "typhoon-v2.5-4b-instruct"
-DEFAULT_FALLBACK_OLLAMA_MODEL_NAME = "typhoon-v2.5-4b-instruct"
-DEFAULT_OLLAMA_BASE_URL = "http://ollama:11434"
-DEFAULT_OLLAMA_TIMEOUT_SECONDS = 60.0
+DEFAULT_OLLAMA_MODEL_NAME = "scb10x/llama3.1-typhoon2-8b-instruct"
+DEFAULT_FALLBACK_OLLAMA_MODEL_NAME = "scb10x/typhoon2.5-qwen3-4b"
+DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+DEFAULT_OLLAMA_TIMEOUT_SECONDS = 300.0
 DEFAULT_OLLAMA_PULL_TIMEOUT_SECONDS = 1800.0
 DEFAULT_OLLAMA_TEMPERATURE = 0.7
 DEFAULT_ECO_NUM_CTX = 1536

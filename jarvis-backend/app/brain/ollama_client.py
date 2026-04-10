@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -36,6 +37,93 @@ from app.config.settings import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ThinkTagFilter:
+    """Streaming filter that suppresses Qwen-family ``<think>…</think>`` blocks.
+
+    Tokens arrive one-at-a-time, so we must handle partial tag boundaries::
+
+        delta="<"  →  buffer, don't emit
+        delta="think"  →  buffer (still partial)
+        delta=">"  →  now inside <think>, suppress everything
+        ...
+        delta="</think>"  →  back outside, resume emitting
+
+    The filter wraps an ``on_delta`` callback and only forwards non-think
+    content up to the caller.
+    """
+
+    _OPEN_TAG = "<think>"
+    _CLOSE_TAG = "</think>"
+
+    def __init__(self, on_delta: Callable[[str], Awaitable[None]]) -> None:
+        self._on_delta = on_delta
+        self._inside_think: bool = False
+        self._buffer: str = ""
+
+    async def feed(self, chunk: str) -> None:
+        """Process one streaming token chunk."""
+        self._buffer += chunk
+
+        while self._buffer:
+            if self._inside_think:
+                # Look for closing tag
+                close_idx = self._buffer.find(self._CLOSE_TAG)
+                if close_idx >= 0:
+                    # Found closing tag — skip everything up to and including it
+                    self._buffer = self._buffer[close_idx + len(self._CLOSE_TAG):]
+                    self._inside_think = False
+                    continue
+                # No closing tag yet — could be a partial match at the end
+                # Keep only enough to potentially match "</think>"
+                keep = len(self._CLOSE_TAG) - 1
+                if len(self._buffer) > keep:
+                    self._buffer = self._buffer[-keep:]
+                return  # Wait for more data
+            else:
+                # Look for opening tag
+                open_idx = self._buffer.find(self._OPEN_TAG)
+                if open_idx >= 0:
+                    # Emit everything before the tag
+                    before = self._buffer[:open_idx]
+                    if before:
+                        await self._on_delta(before)
+                    self._buffer = self._buffer[open_idx + len(self._OPEN_TAG):]
+                    self._inside_think = True
+                    continue
+
+                # Check for partial opening tag at the end of buffer
+                # e.g., buffer ends with "<thi" which could become "<think>"
+                partial_match_start = self._find_partial_tag_start(
+                    self._buffer, self._OPEN_TAG,
+                )
+                if partial_match_start >= 0:
+                    # Emit everything before the potential partial tag
+                    before = self._buffer[:partial_match_start]
+                    if before:
+                        await self._on_delta(before)
+                    self._buffer = self._buffer[partial_match_start:]
+                    return  # Wait for more data to confirm/deny
+                else:
+                    # No tag found, no partial match — emit everything
+                    await self._on_delta(self._buffer)
+                    self._buffer = ""
+                    return
+
+    async def flush(self) -> None:
+        """Flush any remaining buffered content (called at stream end)."""
+        if self._buffer and not self._inside_think:
+            await self._on_delta(self._buffer)
+        self._buffer = ""
+
+    @staticmethod
+    def _find_partial_tag_start(text: str, tag: str) -> int:
+        """Return index where *text* ends with a prefix of *tag*, or -1."""
+        for length in range(min(len(tag) - 1, len(text)), 0, -1):
+            if text.endswith(tag[:length]):
+                return len(text) - length
+        return -1
 
 
 class OllamaClient:
@@ -65,7 +153,7 @@ class OllamaClient:
         """Open the persistent HTTP connection pool."""
         self._http_client = httpx.AsyncClient(
             base_url=self._settings.ollama_base_url,
-            timeout=httpx.Timeout(60.0),
+            timeout=httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=60.0),
             limits=httpx.Limits(
                 max_connections=4,
                 max_keepalive_connections=2,
@@ -94,9 +182,9 @@ class OllamaClient:
         try:
             response = await self._client().get("/api/tags")
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as err:
-            return False, f"unable to connect ({err})"
+            return False, self._http_error_message(err, "unable to connect to Ollama /api/tags")
         except httpx.HTTPError as err:
-            return False, f"HTTP error ({err})"
+            return False, self._http_error_message(err, "HTTP error while requesting Ollama /api/tags")
 
         if response.status_code >= 400:
             return False, f"HTTP {response.status_code}"
@@ -111,9 +199,9 @@ class OllamaClient:
         try:
             response = await self._client().get("/api/ps")
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as err:
-            return False, f"unable to connect ({err})"
+            return False, self._http_error_message(err, "unable to connect to Ollama /api/ps")
         except httpx.HTTPError as err:
-            return False, f"HTTP error ({err})"
+            return False, self._http_error_message(err, "HTTP error while requesting Ollama /api/ps")
 
         if response.status_code >= 400:
             return False, f"HTTP {response.status_code}"
@@ -148,9 +236,9 @@ class OllamaClient:
                 timeout=timeout,
             )
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as err:
-            return False, str(err)
+            return False, self._http_error_message(err, f"timeout while pulling model '{model_name}'")
         except httpx.HTTPError as err:
-            return False, str(err)
+            return False, self._http_error_message(err, f"HTTP error while pulling model '{model_name}'")
 
         if response.status_code >= 400:
             return False, response.text.strip() or f"HTTP {response.status_code}"
@@ -215,9 +303,13 @@ class OllamaClient:
         try:
             response = await self._client().post("/api/chat", json=request_payload)
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as err:
-            raise OllamaUnavailableError(str(err)) from err
+            raise OllamaUnavailableError(
+                self._http_error_message(err, "request to Ollama timed out during non-streaming chat")
+            ) from err
         except httpx.HTTPError as err:
-            raise OllamaUnavailableError(str(err)) from err
+            raise OllamaUnavailableError(
+                self._http_error_message(err, "HTTP error during non-streaming chat request")
+            ) from err
 
         if response.status_code >= 400:
             detail = response.text.strip() or f"HTTP {response.status_code}"
@@ -284,6 +376,7 @@ class OllamaClient:
             t_start = time.monotonic()
             first_token_logged = False
             accumulated = ""
+            think_filter = ThinkTagFilter(on_delta)
 
             async with self._client().stream("POST", "/api/chat", json=request_payload) as response:
                 if response.status_code >= 400:
@@ -356,7 +449,9 @@ class OllamaClient:
                                     )
                                     first_token_logged = True
                                 accumulated += chunk
-                                await on_delta(chunk)
+                                # Feed through think-tag filter so <think>
+                                # blocks are suppressed in real-time.
+                                await think_filter.feed(chunk)
 
                 except (httpx.ReadError, httpx.RemoteProtocolError, httpx.DecodingError) as err:
                     if allow_eof_retry and self._is_eof_error(str(err)):
@@ -369,10 +464,18 @@ class OllamaClient:
                             allow_eof_retry=False,
                             allow_model_fallback=allow_model_fallback,
                         )
-                    raise OllamaUnavailableError(str(err)) from err
+                    raise OllamaUnavailableError(
+                        self._http_error_message(err, "streaming response from Ollama ended unexpectedly")
+                    ) from err
+
+            # Flush any trailing content from the think-tag filter
+            await think_filter.flush()
+
+            # Strip <think>...</think> blocks from accumulated raw text
+            clean_accumulated = re.sub(r"<think>.*?</think>", "", accumulated, flags=re.DOTALL).strip()
 
             # Empty response retry
-            if not accumulated.strip():
+            if not clean_accumulated:
                 if allow_eof_retry:
                     await asyncio.sleep(DEFAULT_EOF_RETRY_DELAY_SECONDS)
                     return await self.generate_streaming(
@@ -384,12 +487,16 @@ class OllamaClient:
                     )
                 raise OllamaResponseError("assistant message content is empty")
 
-            return accumulated.strip()
+            return clean_accumulated
 
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as err:
-            raise OllamaUnavailableError(str(err)) from err
+            raise OllamaUnavailableError(
+                self._http_error_message(err, "request to Ollama timed out during streaming chat")
+            ) from err
         except httpx.HTTPError as err:
-            raise OllamaUnavailableError(str(err)) from err
+            raise OllamaUnavailableError(
+                self._http_error_message(err, "HTTP error during streaming chat request")
+            ) from err
 
     # ------------------------------------------------------------------
     # Prewarm
@@ -415,9 +522,13 @@ class OllamaClient:
         try:
             response = await self._client().post("/api/chat", json=payload)
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as err:
-            raise OllamaUnavailableError(str(err)) from err
+            raise OllamaUnavailableError(
+                self._http_error_message(err, "request to Ollama timed out during model prewarm")
+            ) from err
         except httpx.HTTPError as err:
-            raise OllamaUnavailableError(str(err)) from err
+            raise OllamaUnavailableError(
+                self._http_error_message(err, "HTTP error during model prewarm")
+            ) from err
 
         if response.status_code >= 400:
             detail = response.text.strip() or f"HTTP {response.status_code}"
@@ -462,7 +573,11 @@ class OllamaClient:
         content = msg.get("content")
         if not isinstance(content, str) or not content.strip():
             raise OllamaResponseError("assistant message content is empty")
-        return content.strip()
+        # Strip Qwen-family <think>...</think> reasoning blocks
+        cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        if not cleaned:
+            raise OllamaResponseError("assistant message content is empty after stripping thinking tags")
+        return cleaned
 
     def _raise_from_detail(self, status_code: int, detail: str) -> None:
         """Raise the appropriate exception based on the error detail."""
@@ -472,6 +587,13 @@ class OllamaClient:
         ):
             raise OllamaModelError(detail)
         raise OllamaUnavailableError(detail)
+
+    @staticmethod
+    def _http_error_message(err: Exception, fallback: str) -> str:
+        message = str(err).strip()
+        if message:
+            return message
+        return fallback
 
     # ------------------------------------------------------------------
     # Status

@@ -49,16 +49,16 @@ PERFORMANCE_PROFILE = HardwareProfile(
     mode="performance",
     num_ctx=1024,
     num_thread=8,   # All P-Cores on i5-13420H
-    num_gpu=0,      # iGPU off by default; enabled by OLLAMA_INTEL_GPU=1
-    description="8B Typhoon model — full P-Core burst, 1K context window",
+    num_gpu=0,      # CPU-only; set OLLAMA_INTEL_GPU=1 for iGPU offload
+    description="Typhoon 8B — full P-Core burst, 1K context window",
 )
 
 ECO_PROFILE = HardwareProfile(
     mode="eco",
     num_ctx=1536,   # Slightly larger ctx for the lighter 4B model
-    num_thread=2,   # Minimal CPU, leave headroom for UI/TTS
+    num_thread=4,   # More threads to keep eco model responsive
     num_gpu=0,
-    description="4B Typhoon model — low-power background mode",
+    description="Typhoon 4B — balanced power mode",
 )
 
 FALLBACK_PROFILE = HardwareProfile(
@@ -88,8 +88,8 @@ HTTP_CHAT_NUM_THREAD: dict[str, int] = {
 # Tuning knobs
 # ---------------------------------------------------------------------------
 
-DEFAULT_OLLAMA_BASE_URL = "http://ollama:11434"
-DEFAULT_OLLAMA_TIMEOUT_SECONDS = 60.0
+DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+DEFAULT_OLLAMA_TIMEOUT_SECONDS = 300.0  # 5 minutes — 9B model on CPU needs time
 DEFAULT_OLLAMA_PULL_TIMEOUT_SECONDS = 1800.0
 DEFAULT_OLLAMA_TEMPERATURE = 0.7
 DEFAULT_OLLAMA_KEEP_ALIVE = -1
@@ -147,12 +147,12 @@ class Settings:
 
         eco_model = (
             os.getenv("JARVIS_MODEL_ECO", "").strip()
-            or "scb10x/typhoon2.5-qwen3-4b:latest"
+            or "scb10x/typhoon2.5-qwen3-4b"
         )
         performance_model = (
             os.getenv("JARVIS_MODEL_PERFORMANCE", "").strip()
             or os.getenv("JARVIS_MODEL_NAME", "").strip()
-            or "scb10x/llama3.1-typhoon2-8b-instruct:latest"
+            or "scb10x/llama3.1-typhoon2-8b-instruct"
         )
 
         self._models: dict[str, str] = {

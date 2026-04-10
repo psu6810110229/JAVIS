@@ -1,22 +1,24 @@
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600&family=Inter:wght@400;500;600&display=swap");
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  color: #e0e0e0;
-  background:
-    linear-gradient(180deg, rgba(30, 30, 30, 0.25) 0%, rgba(10, 10, 10, 0.95) 56%),
-    #0a0a0a;
-  font-family: "Inter", "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  color: #e2e8f0;
+  /* Deep, layered background with a warm central glow */
+  background: 
+    radial-gradient(circle at 50% 50%, rgba(30, 41, 59, 0.4) 0%, transparent 60%),
+    linear-gradient(180deg, #020617 0%, #0f172a 100%);
+  font-family: "Outfit", "Inter", sans-serif;
+  -webkit-font-smoothing: antialiased;
 }
 
 body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background: #0a0a0a;
+  background: #020617;
 }
 
 #root {
@@ -24,7 +26,10 @@ body {
 }
 
 .minimal-root {
-  background: linear-gradient(180deg, #121212 0%, #0a0a0a 100%);
+  /* Premium glass surface */
+  background: rgba(15, 23, 42, 0.65);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
 }
 
 .breathing-soft {

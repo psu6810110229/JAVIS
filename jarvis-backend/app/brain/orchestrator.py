@@ -48,7 +48,11 @@ from app.brain.exceptions import (
     OllamaUnavailableError,
 )
 from app.brain.memory import SessionMemory
-from app.brain.memory_guardian import GuardianDecision, MemoryGuardian
+from app.brain.memory_guardian import (
+    PAGEFILE_GUARDRAIL_PERCENT,
+    GuardianDecision,
+    MemoryGuardian,
+)
 from app.brain.models import (
     AssistantAudioPayload,
     AudioChunkAcknowledgement,
@@ -66,7 +70,6 @@ from app.config.settings import (
     DEFAULT_LOW_RAM_FORCE_ECO_BYTES,
     DEFAULT_LLM_MEMORY_CAP_BYTES,
     DEFAULT_MODE_SWITCH_COOLDOWN_SECONDS,
-    DEFAULT_PAGEFILE_GUARDRAIL_PERCENT,
     DEFAULT_PERFORMANCE_RETRY_COOLDOWN_SECONDS,
     DEFAULT_SENTENCE_TTS_CONCURRENCY,
     DEFAULT_STREAM_TEXT_FLUSH_MIN_CHARS,
@@ -82,14 +85,24 @@ from app.tts.host_client import TtsEngineError, TtsHostClient
 
 logger = logging.getLogger(__name__)
 
-_MAX_TOOL_CALL_ROUNDS = 2
+_MAX_TOOL_CALL_ROUNDS = 4
 _MAX_TOOL_RESULT_CHARS = 900
+
+# Regex to strip Qwen-family <think>...</think> reasoning blocks from output.
+_THINK_TAG_RE = __import__("re").compile(r"<think>.*?</think>", __import__("re").DOTALL)
 
 _SYSTEM_INSTRUCTION = (
     "You are Jarvis. Stay polite, concise, and use a British professional tone. "
     "Acknowledge the current mode (Eco/Performance) only if asked. "
     "For small talk, keep replies brief. For technical requests, respond clearly and directly. "
     "Avoid unnecessary verbosity and keep output practical. "
+    "If the user asks about battery, RAM, memory, or CPU status, you MUST call get_system_status first. "
+    "Never guess hardware or system metrics from internal knowledge. "
+    "When asked what applications you can open, you MUST check the description of the open_local_app tool and list ONLY the exact supported applications. Do not assume or guess applications like Google Docs. "
+    "If the user asks to open a file or folder on the local machine, use the open_path tool. "
+    "If the user asks what's in a folder or to browse files on the local machine, use the browse_filesystem tool. "
+    "If the user asks to find a file on the local machine, use the search_files tool first, then open_path if requested. "
+    "Never fabricate file paths. Always use tools to verify and locate local files. "
     "Always answer in English unless the user specifically requests Thai. "
 )
 
@@ -122,7 +135,7 @@ class Orchestrator:
         self._llm_memory_cap_bytes: int = DEFAULT_LLM_MEMORY_CAP_BYTES
         self._low_ram_force_eco_bytes: int = DEFAULT_LOW_RAM_FORCE_ECO_BYTES
         self._high_swap_force_eco_percent: float = DEFAULT_HIGH_SWAP_FORCE_ECO_PERCENT
-        self._pagefile_guardrail_percent: float = DEFAULT_PAGEFILE_GUARDRAIL_PERCENT
+        self._pagefile_guardrail_percent: float = PAGEFILE_GUARDRAIL_PERCENT
         self._last_pressure_error: str | None = None
         self._last_low_ram_force_eco_message: str | None = None
 
@@ -249,7 +262,16 @@ class Orchestrator:
 
         return await self._attach_audio(BrainResponse(text=response_text, tool_schemas=self.tool_schemas))
 
-    def _build_tool_protocol_prompt(self) -> str:
+    @staticmethod
+    def _format_mode_label(mode: str) -> str:
+        normalized = (mode or "").strip().lower()
+        if normalized == "performance":
+            return "Performance"
+        if normalized == "eco":
+            return "Eco"
+        return mode or "Unknown"
+
+    def _build_tool_protocol_prompt(self, current_mode: str) -> str:
         lines: list[str] = []
         for schema in self.tool_schemas:
             props = schema.parameters.get("properties", {})
@@ -257,8 +279,11 @@ class Orchestrator:
             lines.append(f"- {schema.name}({arg_names})")
 
         tools_text = "\n".join(lines) if lines else "- (no tools available)"
+        mode_label = self._format_mode_label(current_mode)
         return (
             "Tool protocol for this turn:\n"
+            f"You are currently in {mode_label} mode.\n"
+            "Do not invent or assume reasons for missing data based on your mode.\n"
             "If a tool is required, output only compact JSON with no markdown: "
             '{"t":"tool","n":"tool_name","a":{}}.\n'
             "If no tool is required, answer naturally in plain text.\n"
@@ -266,8 +291,15 @@ class Orchestrator:
             f"{tools_text}"
         )
 
-    def _inject_tool_protocol(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
-        protocol_message = {"role": "system", "content": self._build_tool_protocol_prompt()}
+    def _inject_tool_protocol(
+        self,
+        messages: list[dict[str, str]],
+        current_mode: str,
+    ) -> list[dict[str, str]]:
+        protocol_message = {
+            "role": "system",
+            "content": self._build_tool_protocol_prompt(current_mode=current_mode),
+        }
         if messages and messages[0].get("role") == "system":
             return [messages[0], protocol_message, *messages[1:]]
         return [protocol_message, *messages]
@@ -333,11 +365,25 @@ class Orchestrator:
     @staticmethod
     def _guardian_message(decision: GuardianDecision) -> str:
         if decision.requires_mode_confirmation and decision.suggested_mode:
+            if decision.tool_name == "get_system_status":
+                return (
+                    "I can see your battery, RAM, and CPU through get_system_status, "
+                    f"but I need your confirmation to switch to {decision.suggested_mode} mode "
+                    "first so I can keep memory stable."
+                )
             return (
                 f"I need your confirmation to switch to {decision.suggested_mode} mode "
                 f"before I run '{decision.tool_name}'."
             )
-        return decision.reason + " Please free memory and retry."
+        if decision.tool_name == "get_system_status":
+            return (
+                "I can see your battery, RAM, and CPU, but I need to save memory right now. "
+                f"{decision.reason}"
+            )
+        return (
+            f"I’m pausing '{decision.tool_name}' to keep the system stable. "
+            f"{decision.reason}"
+        )
 
     async def _generate_with_tool_loop(
         self,
@@ -347,15 +393,27 @@ class Orchestrator:
         profile: Any,
     ) -> str:
         working_messages = [dict(message) for message in messages]
+        original_user_request = next(
+            (
+                str(message.get("content", "")).strip()
+                for message in reversed(messages)
+                if message.get("role") == "user" and str(message.get("content", "")).strip()
+            ),
+            "",
+        )
 
         for _ in range(_MAX_TOOL_CALL_ROUNDS + 1):
-            protocol_messages = self._inject_tool_protocol(working_messages)
+            protocol_messages = self._inject_tool_protocol(
+                working_messages,
+                current_mode=profile.mode,
+            )
             response_text = await self._ollama.generate(
                 protocol_messages,
                 model_name,
                 profile,
                 num_gpu=self._resolve_num_gpu(profile.mode),
             )
+            response_text = self._strip_thinking_tags(response_text)
             parsed = self._extract_tool_call(response_text)
             if parsed is None:
                 return response_text.strip()
@@ -406,14 +464,146 @@ class Orchestrator:
                 {
                     "role": "user",
                     "content": (
-                        f"Tool result ({tool_name}): {result_text}. "
-                        "Continue and answer the original request naturally. "
-                        "Do not output JSON."
+                        f"Tool result ({tool_name}): {result_text}\n"
+                        f"Original user request: {original_user_request or 'Use the user request in context.'}\n"
+                        "Now answer the original user request directly in natural language.\n"
+                        "If the user asked 'why', include clear causal reasoning grounded in the tool result.\n"
+                        "If any metric is unavailable, state that it is unavailable.\n"
+                        "If the user contradicts sensor output, acknowledge sensors may be stale or failing.\n"
+                        "Do not argue with the user and do not invent theories to defend sensor output.\n"
+                        "Never gaslight the user.\n"
+                        "Do not guess missing values or blame the current mode.\n"
+                        "Do not output JSON, markdown code fences, or raw object dumps."
                     ),
                 }
             )
 
         return "I could not complete the request safely within the local tool-call limit."
+
+    @classmethod
+    def _sanitize_visible_text(cls, text: str) -> str:
+        cleaned = cls._strip_thinking_tags(text).strip()
+        if not cleaned:
+            return "I did not generate a response."
+
+        if cleaned.startswith("```"):
+            cleaned = "\n".join(
+                line for line in cleaned.splitlines() if not line.strip().startswith("```")
+            ).strip()
+
+        if cls._extract_tool_call(cleaned) is not None:
+            return "Working on that now."
+
+        visible_lines: list[str] = []
+        for line in cleaned.splitlines():
+            if cls._extract_tool_call(line.strip()) is not None:
+                continue
+            visible_lines.append(line)
+
+        visible_text = "\n".join(visible_lines).strip()
+        return visible_text or "Done."
+
+    @staticmethod
+    def _strip_thinking_tags(text: str) -> str:
+        """Remove Qwen-family <think>...</think> reasoning blocks from model output."""
+        return _THINK_TAG_RE.sub("", text).strip()
+
+    @staticmethod
+    def _chunk_text_for_streaming(text: str, chunk_size: int = 56) -> list[str]:
+        chunks: list[str] = []
+        cursor = 0
+        limit = max(16, int(chunk_size))
+
+        while cursor < len(text):
+            end = min(len(text), cursor + limit)
+            split = end
+            if end < len(text):
+                window = text[cursor:end]
+                pivot = max(window.rfind(" "), window.rfind("\n"))
+                if pivot >= 16:
+                    split = cursor + pivot + 1
+            chunk = text[cursor:split]
+            if chunk:
+                chunks.append(chunk)
+            cursor = split
+
+        return chunks
+
+    async def _emit_stream_deltas(
+        self,
+        text: str,
+        on_stream_delta: Callable[[str], Awaitable[None]],
+    ) -> None:
+        for chunk in self._chunk_text_for_streaming(text):
+            await on_stream_delta(chunk)
+            await asyncio.sleep(0)
+
+    @staticmethod
+    def _needs_system_status_tool(user_text: str) -> bool:
+        normalized = user_text.lower()
+        keywords = (
+            "battery",
+            "cpu",
+            "ram",
+            "memory",
+            "pagefile",
+            "swap",
+            "system status",
+            "check the sys",
+            "สถานะเครื่อง",
+            "แบต",
+            "แรม",
+            "ซีพียู",
+        )
+        return any(keyword in normalized for keyword in keywords)
+
+    async def _build_streaming_messages(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        user_text: str,
+        active_mode: str,
+    ) -> tuple[list[dict[str, str]], str | None]:
+        """Build a fast streaming prompt path.
+
+        For system-health queries we execute get_system_status first, then stream a
+        grounded synthesis answer. For all other queries we stream directly.
+        """
+        if not self._needs_system_status_tool(user_text):
+            return messages, None
+
+        decision = await self._assess_tool_call(tool_name="get_system_status", active_mode=active_mode)
+        if not decision.allowed:
+            return [], self._guardian_message(decision)
+
+        try:
+            tool_result = await tool_registry.execute("get_system_status", {})
+        except (KeyError, ValueError, RuntimeError) as err:
+            return [], (
+                "I could not run the local system-status tool right now. "
+                f"Error: {err}"
+            )
+
+        result_text = self._format_tool_result(tool_result)
+        grounded_messages = [dict(message) for message in messages]
+        grounded_messages.append({"role": "assistant", "content": "Tool 'get_system_status' executed."})
+        grounded_messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"Tool result (get_system_status): {result_text}\n"
+                    f"Original user request: {user_text.strip()}\n"
+                    "Answer directly and naturally.\n"
+                    "If the user asked why, provide causal reasoning grounded only in this tool result.\n"
+                    "If a value is unavailable, say it is unavailable.\n"
+                    "If the user contradicts sensor output, acknowledge sensors may be stale or failing.\n"
+                    "Do not argue with the user and do not invent theories to defend sensor output.\n"
+                    "Never gaslight the user.\n"
+                    "Do not output JSON or raw object dumps."
+                ),
+            }
+        )
+        return grounded_messages, None
 
     # ------------------------------------------------------------------
     # WebSocket streaming text inference
@@ -438,22 +628,39 @@ class Orchestrator:
             self._memory.append_user(session_id, user_text)
             model_name, profile = self._resolve_model_and_profile()
             try:
+                await self._enforce_pressure_guardrail(model_name)
+                await self._invoke_host_optimizer(model_name=model_name, mode=profile.mode)
                 await on_stream_start(model_name)
-                response_text = await self._ollama.generate_streaming(
-                    self._memory.get_messages(session_id) or [],
-                    model_name,
-                    profile,
-                    on_delta=on_stream_delta,
-                    num_gpu=self._resolve_num_gpu(profile.mode),
+
+                session_messages = [
+                    dict(message) for message in (self._memory.get_messages(session_id) or [])
+                ]
+                streaming_messages, immediate_text = await self._build_streaming_messages(
+                    messages=session_messages,
+                    user_text=user_text,
+                    active_mode=profile.mode,
                 )
-                await on_stream_end(response_text)
-                self._memory.append_assistant(session_id, response_text)
+
+                if immediate_text is not None:
+                    visible_text = self._sanitize_visible_text(immediate_text)
+                    await self._emit_stream_deltas(visible_text, on_stream_delta)
+                else:
+                    visible_text = await self._ollama.generate_streaming(
+                        streaming_messages,
+                        model_name,
+                        profile,
+                        on_stream_delta,
+                        num_gpu=self._resolve_num_gpu(profile.mode),
+                    )
+                    visible_text = self._sanitize_visible_text(visible_text)
+
+                await on_stream_end(visible_text)
+                self._memory.append_assistant(session_id, visible_text)
                 self._ollama_available = True
             except (OllamaUnavailableError, OllamaModelError, OllamaResponseError, RuntimeError) as err:
                 self._memory.pop_last(session_id)
                 return BrainResponse(text=str(err), tool_schemas=self.tool_schemas)
-
-        return await self._attach_audio(BrainResponse(text=response_text, tool_schemas=self.tool_schemas))
+        return await self._attach_audio(BrainResponse(text=visible_text, tool_schemas=self.tool_schemas))
 
     # ------------------------------------------------------------------
     # HTTP chat streaming (NDJSON) — primary UI path
@@ -492,29 +699,51 @@ class Orchestrator:
             self._memory.append_user(session_id, user_text)
             model_name, profile = self._resolve_model_and_profile()
             http_num_thread = HTTP_CHAT_NUM_THREAD.get(profile.mode, profile.num_thread)
+            effective_num_ctx = (
+                num_ctx_override
+                if isinstance(num_ctx_override, int) and num_ctx_override > 0
+                else profile.num_ctx
+            )
             effective_profile = PERFORMANCE_PROFILE.__class__(
                 mode=profile.mode,
-                num_ctx=profile.num_ctx,
+                num_ctx=effective_num_ctx,
                 num_thread=http_num_thread,
                 num_gpu=profile.num_gpu,
                 description=profile.description,
             )
 
             try:
-                final_text = await self._ollama.generate_streaming(
-                    self._memory.get_messages(session_id) or [],
-                    model_name,
-                    effective_profile,
-                    on_delta=streamer.on_delta,
-                    num_gpu=self._resolve_num_gpu(profile.mode),
-                    num_ctx_override=num_ctx_override,
+                await self._enforce_pressure_guardrail(model_name)
+                await self._invoke_host_optimizer(model_name=model_name, mode=profile.mode)
+
+                session_messages = [
+                    dict(message) for message in (self._memory.get_messages(session_id) or [])
+                ]
+                streaming_messages, immediate_text = await self._build_streaming_messages(
+                    messages=session_messages,
+                    user_text=user_text,
+                    active_mode=effective_profile.mode,
                 )
+
+                if immediate_text is not None:
+                    final_text = self._sanitize_visible_text(immediate_text).strip()
+                    for chunk in self._chunk_text_for_streaming(final_text):
+                        await streamer.on_delta(chunk)
+                else:
+                    final_text = await self._ollama.generate_streaming(
+                        streaming_messages,
+                        model_name,
+                        effective_profile,
+                        streamer.on_delta,
+                        num_gpu=self._resolve_num_gpu(effective_profile.mode),
+                        num_ctx_override=effective_num_ctx,
+                    )
+                    final_text = self._sanitize_visible_text(final_text).strip()
 
                 # Flush trailing text and dispatch trailing TTS sentence
                 trailing = streamer.get_trailing_sentence_buffer()
                 await streamer.flush_final(trailing_buffer=trailing)
 
-                final_text = final_text.strip()
                 self._memory.append_assistant(session_id, final_text)
                 self._ollama_available = True
                 self._initialization_error = None
@@ -756,7 +985,7 @@ class Orchestrator:
         return model_name, self._settings.get_profile(mode)
 
     def _resolve_num_gpu(self, mode: str) -> int:
-        if not self._settings.intel_gpu_requested or self._gpu_soft_fallback:
+        if self._gpu_soft_fallback:
             return 0
         profile = self._settings.get_profile(mode)
         return profile.num_gpu

@@ -5,3 +5,4 @@ __pycache__/
 dist/
 node_modules/
 jarvis-frontend/src-tauri/target/
+scripts/.cache/

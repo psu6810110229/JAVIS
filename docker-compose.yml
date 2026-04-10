@@ -42,10 +42,10 @@ services:
       - kokoro
     environment:
       # ── Model configuration ──────────────────────────────────────────────
-      # Performance model: Typhoon 8B — high-quality, uses ~8GB
-      JARVIS_MODEL_PERFORMANCE: ${JARVIS_MODEL_PERFORMANCE:-scb10x/llama3.1-typhoon2-8b-instruct}
-      # Eco model: Typhoon 4B — lighter, faster, uses ~3GB
-      JARVIS_MODEL_ECO: ${JARVIS_MODEL_ECO:-scb10x/typhoon2.5-qwen3-4b}
+      # Performance model: Qwen 3.5 9B — strong general quality
+      JARVIS_MODEL_PERFORMANCE: ${JARVIS_MODEL_PERFORMANCE:-qwen3.5:9b}
+      # Eco model: Qwen3-VL 4B — lighter multimodal option
+      JARVIS_MODEL_ECO: ${JARVIS_MODEL_ECO:-qwen3-vl:4b}
 
       # ── Ollama connection ────────────────────────────────────────────────
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}

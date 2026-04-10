@@ -816,9 +816,10 @@ function App() {
           }
 
           if (eventType === "error") {
+            const rawMessage = typeof event.message === "string" ? event.message.trim() : "";
             streamErrorMessage =
-              typeof event.message === "string"
-                ? event.message
+              rawMessage.length > 0
+                ? rawMessage
                 : "Jarvis encountered an unexpected streaming error.";
             break;
           }

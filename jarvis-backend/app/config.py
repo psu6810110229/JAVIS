@@ -31,12 +31,12 @@ class SystemConfig:
         self._lock = RLock()
         eco_model = (
             os.getenv("JARVIS_MODEL_ECO", "").strip()
-            or "scb10x/typhoon2.5-qwen3-4b:latest"
+            or "scb10x/typhoon2.5-qwen3-4b"
         )
         performance_model = (
             os.getenv("JARVIS_MODEL_PERFORMANCE", "").strip()
             or os.getenv("JARVIS_MODEL_NAME", "").strip()
-            or "scb10x/llama3.1-typhoon2-8b-instruct:latest"
+            or "scb10x/llama3.1-typhoon2-8b-instruct"
         )
         eco_model = self._normalize_model_name(eco_model)
         performance_model = self._normalize_model_name(performance_model)

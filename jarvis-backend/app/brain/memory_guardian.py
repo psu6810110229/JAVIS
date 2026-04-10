@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from typing import Any
 
 
+PAGEFILE_GUARDRAIL_PERCENT = 25.0
+
+
 @dataclass(frozen=True)
 class GuardianDecision:
     """Decision returned by MemoryGuardian for a proposed tool call."""
@@ -31,7 +34,7 @@ class MemoryGuardian:
         *,
         low_ram_force_eco_bytes: int,
         high_swap_force_eco_percent: float,
-        pagefile_guardrail_percent: float,
+        pagefile_guardrail_percent: float = PAGEFILE_GUARDRAIL_PERCENT,
         safety_reserve_bytes: int = 768 * 1024 * 1024,
     ) -> None:
         self._low_ram_force_eco_bytes = low_ram_force_eco_bytes
@@ -56,12 +59,26 @@ class MemoryGuardian:
         projected_required = (estimated_ram_mb * 1024 * 1024) + self._safety_reserve_bytes
         required_mode = str(tool_metadata.get("required_mode") or "either").lower()
 
+        # Always allow status introspection so users can diagnose pressure conditions.
+        if tool_name == "get_system_status":
+            return GuardianDecision(
+                allowed=True,
+                reason=(
+                    "System status introspection is allowed even under memory pressure."
+                ),
+                available_ram_bytes=available_ram,
+                pagefile_percent=pagefile_percent,
+                projected_required_ram_bytes=projected_required,
+                tool_name=tool_name,
+            )
+
         if pagefile_percent > self._pagefile_guardrail_percent:
             return GuardianDecision(
                 allowed=False,
                 reason=(
-                    f"I cannot run '{tool_name}' right now because pagefile pressure is "
-                    f"{pagefile_percent:.1f}% (limit {self._pagefile_guardrail_percent:.1f}%)."
+                    f"I can run '{tool_name}', but I need to protect memory right now. "
+                    f"Pagefile pressure is {pagefile_percent:.1f}% and my safety limit is "
+                    f"{self._pagefile_guardrail_percent:.1f}%."
                 ),
                 available_ram_bytes=available_ram,
                 pagefile_percent=pagefile_percent,
@@ -73,8 +90,8 @@ class MemoryGuardian:
             return GuardianDecision(
                 allowed=False,
                 reason=(
-                    f"I cannot run '{tool_name}' safely with current free RAM "
-                    f"({available_ram / (1024**3):.2f} GB available)."
+                    f"I can run '{tool_name}', but I need to save memory first. "
+                    f"Only {available_ram / (1024**3):.2f} GB RAM is currently available."
                 ),
                 available_ram_bytes=available_ram,
                 pagefile_percent=pagefile_percent,
@@ -89,8 +106,8 @@ class MemoryGuardian:
             return GuardianDecision(
                 allowed=False,
                 reason=(
-                    "Resource pressure is high for performance mode. "
-                    "I recommend switching to eco mode before tool execution."
+                    "I can proceed, but performance mode is under pressure right now. "
+                    "I recommend switching to eco mode first to avoid memory spikes."
                 ),
                 requires_mode_confirmation=True,
                 suggested_mode="eco",

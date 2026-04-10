@@ -259,11 +259,12 @@ async def post_chat(payload: ChatRequestPayload) -> StreamingResponse:
                         "timestamp": utc_timestamp(),
                     })
             except (OllamaUnavailableError, OllamaModelError, RuntimeError) as err:
+                error_message = str(err).strip() or "Jarvis encountered an internal streaming error."
                 await queue.put({
                     "type": "error",
                     "stream_id": stream_id,
                     "session_id": session_id,
-                    "message": str(err),
+                    "message": error_message,
                     "timestamp": utc_timestamp(),
                 })
             finally:
