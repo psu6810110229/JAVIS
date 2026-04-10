@@ -8,6 +8,13 @@ services:
       - ollama_data:/root/.ollama
     restart: unless-stopped
 
+  kokoro:
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    container_name: kokoro
+    ports:
+      - "8880:8880"
+    restart: unless-stopped
+
   jarvis-backend:
     build:
       context: ./jarvis-backend
@@ -15,10 +22,10 @@ services:
     container_name: jarvis-backend
     depends_on:
       - ollama
+      - kokoro
     environment:
-      JARVIS_MODEL_NAME: scb10x/typhoon2.5-qwen3-4b
+      JARVIS_MODEL_NAME: scb10x/llama3.1-typhoon2-8b-instruct
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
-      ELEVENLABS_API_KEY: sk_01090178dd5dc2fabc1881d94bf6dc2483d760dab3a61074
     ports:
       - "8000:8000"
     volumes:

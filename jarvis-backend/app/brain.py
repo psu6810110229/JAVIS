@@ -16,12 +16,17 @@ from pydub import AudioSegment
 from pydub.exceptions import CouldntDecodeError
 
 from .config import load_project_env
-from .tts_engine import ElevenLabsTtsEngine, TtsEngineError
+from .tts_engine import KokoroTtsEngine, TtsEngineError
 
 logger = logging.getLogger(__name__)
-DEFAULT_OLLAMA_MODEL_NAME = "scb10x/typhoon2.5-qwen3-4b"
+DEFAULT_OLLAMA_MODEL_NAME = "scb10x/llama3.1-typhoon2-8b-instruct"
+DEFAULT_FALLBACK_OLLAMA_MODEL_NAME = "llama3:8b"
 DEFAULT_OLLAMA_BASE_URL = "http://ollama:11434"
 DEFAULT_OLLAMA_TIMEOUT_SECONDS = 60.0
+DEFAULT_OLLAMA_PULL_TIMEOUT_SECONDS = 1800.0
+DEFAULT_OLLAMA_TEMPERATURE = 0.7
+DEFAULT_OLLAMA_NUM_CTX = 2048
+FALLBACK_OLLAMA_NUM_CTX = 1024
 DEFAULT_STT_LANGUAGE = "th-TH"
 
 
@@ -75,18 +80,27 @@ class VoiceInteractionResult(BaseModel):
 class JarvisBrain:
     def __init__(self, model_name: str | None = None) -> None:
         load_project_env()
-        self._model_name = DEFAULT_OLLAMA_MODEL_NAME
+        self._preferred_model_name = model_name or DEFAULT_OLLAMA_MODEL_NAME
+        self._fallback_model_name = DEFAULT_FALLBACK_OLLAMA_MODEL_NAME
+        self._model_name = self._preferred_model_name
         self._ollama_base_url = DEFAULT_OLLAMA_BASE_URL
         self._ollama_timeout = DEFAULT_OLLAMA_TIMEOUT_SECONDS
-        self._tts_engine = ElevenLabsTtsEngine()
+        self._ollama_pull_timeout = DEFAULT_OLLAMA_PULL_TIMEOUT_SECONDS
+        self._tts_engine = KokoroTtsEngine()
         self._tts_voice = self._tts_engine.voice_label
         self._stt_language = DEFAULT_STT_LANGUAGE
         self._system_instruction = (
-            "คุณคือ Jarvis (จาร์วิส) เอไอผู้ช่วยส่วนตัวที่ชาญฉลาดและซื่อสัตย์ "
-            "คุณต้องเรียกผู้ใช้ว่า 'Sir' (เซอร์) หรือ 'คุณ Fran' เสมอ (ห้ามเรียกว่า สิริ) "
-            "การตอบต้องกระชับ มีไหวพริบ และมีความเป็นมืออาชีพ "
-            "ต้องลงท้ายประโยคด้วยคำว่า 'ครับ' ทุกครั้งเพื่อให้ดูสุภาพ "
-            "สื่อสารด้วยภาษาไทยที่เข้าใจง่ายและเป็นธรรมชาติ"
+            "You are Jarvis: sophisticated, intelligent, and subtly witty. "
+            "You are a trusted partner to Me, not a robotic script. "
+            "Always address the user as Sir or You. "
+            "Dynamic value rule: match response depth to user intent. "
+            "For small talk like hey or morning, keep replies under 10 words. "
+            "For direct commands like be quiet or shut up, confirm politely and then stop, for example: Certainly, Sir. Standing by. "
+            "For technical or knowledge questions, give a clear 2-3 sentence overview, then wait. "
+            "If the user asks for details or follow-up, expand naturally. "
+            "Use modern professional English with occasional dry British wit. "
+            "Avoid lectures, avoid unnecessary fluff, and do not correct grammar, slang, or typos. "
+            "Prefer efficiency with class."
         )
         self._sessions: dict[str, list[dict[str, str]] | None] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
@@ -109,7 +123,7 @@ class JarvisBrain:
                 return
 
             try:
-                self._ollama_available, self._initialization_error = await self._check_ollama_health()
+                self._ollama_available, self._initialization_error = await self._ensure_model_ready()
             except (RuntimeError, TypeError, ValueError) as error:
                 self._ollama_available = False
                 self._initialization_error = str(error)
@@ -128,6 +142,110 @@ class JarvisBrain:
                     self._ollama_base_url,
                     self._initialization_error or "unknown reason",
                 )
+
+    async def _ensure_model_ready(self) -> tuple[bool, str | None]:
+        healthy, payload_or_error = await self._fetch_ollama_tags()
+        if not healthy:
+            return False, payload_or_error
+
+        assert isinstance(payload_or_error, dict)
+        available_models = self._extract_model_names(payload_or_error)
+        if self._model_name in available_models:
+            return True, None
+
+        logger.warning("Ollama model '%s' is missing. Attempting pull.", self._model_name)
+        pulled, pull_error = await self._pull_model(self._model_name)
+        if pulled:
+            return True, None
+
+        if self._fallback_model_name != self._model_name:
+            logger.warning(
+                "Could not pull preferred model '%s' (%s). Falling back to '%s'.",
+                self._model_name,
+                pull_error or "unknown error",
+                self._fallback_model_name,
+            )
+            self._model_name = self._fallback_model_name
+            if self._model_name not in available_models:
+                fallback_pulled, fallback_error = await self._pull_model(self._model_name)
+                if not fallback_pulled:
+                    return (
+                        False,
+                        (
+                            f"Failed to pull preferred model '{self._preferred_model_name}' and "
+                            f"fallback model '{self._fallback_model_name}': {fallback_error or pull_error or 'unknown error'}"
+                        ),
+                    )
+            return True, None
+
+        return False, f"Failed to pull model '{self._model_name}': {pull_error or 'unknown error'}"
+
+    async def _fetch_ollama_tags(self) -> tuple[bool, dict[str, Any] | str]:
+        try:
+            timeout = httpx.Timeout(self._ollama_timeout)
+            async with httpx.AsyncClient(base_url=self._ollama_base_url, timeout=timeout) as client:
+                response = await client.get("/api/tags")
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as error:
+            return False, f"unable to connect ({error})"
+        except httpx.HTTPError as error:
+            return False, f"HTTP error ({error})"
+
+        if response.status_code >= 400:
+            return False, f"HTTP {response.status_code}"
+
+        try:
+            payload = response.json()
+        except ValueError as error:
+            return False, f"invalid health payload ({error})"
+
+        return True, payload
+
+    async def _pull_model(self, model_name: str) -> tuple[bool, str | None]:
+        request_payload = {
+            "name": model_name,
+            "stream": False,
+        }
+
+        try:
+            timeout = httpx.Timeout(self._ollama_pull_timeout)
+            async with httpx.AsyncClient(base_url=self._ollama_base_url, timeout=timeout) as client:
+                response = await client.post("/api/pull", json=request_payload)
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as error:
+            return False, str(error)
+        except httpx.HTTPError as error:
+            return False, str(error)
+
+        if response.status_code >= 400:
+            return False, response.text.strip() or f"HTTP {response.status_code}"
+
+        try:
+            payload = response.json()
+        except ValueError:
+            return True, None
+
+        payload_error = payload.get("error")
+        if isinstance(payload_error, str) and payload_error.strip():
+            return False, payload_error
+
+        return True, None
+
+    @staticmethod
+    def _extract_model_names(payload: dict[str, Any]) -> set[str]:
+        models = payload.get("models")
+        if not isinstance(models, list):
+            return set()
+
+        resolved: set[str] = set()
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            model_name = model.get("name")
+            if not isinstance(model_name, str):
+                continue
+            resolved.add(model_name)
+            resolved.add(model_name.split(":", 1)[0])
+
+        return resolved
 
     async def create_session(self, session_id: str) -> None:
         await self.initialize()
@@ -266,6 +384,10 @@ class JarvisBrain:
             "model": self._model_name,
             "messages": messages,
             "stream": False,
+            "options": {
+                "temperature": DEFAULT_OLLAMA_TEMPERATURE,
+                "num_ctx": DEFAULT_OLLAMA_NUM_CTX,
+            },
         }
 
         try:
@@ -279,6 +401,30 @@ class JarvisBrain:
 
         if response.status_code >= 400:
             detail = response.text.strip() or f"HTTP {response.status_code}"
+
+            # Retry once with a smaller context when Ollama runner fails to load 8B model reliably.
+            if "runner process has terminated" in detail.lower():
+                retry_payload = {
+                    **request_payload,
+                    "options": {
+                        "temperature": DEFAULT_OLLAMA_TEMPERATURE,
+                        "num_ctx": FALLBACK_OLLAMA_NUM_CTX,
+                    },
+                }
+                try:
+                    timeout = httpx.Timeout(self._ollama_timeout)
+                    async with httpx.AsyncClient(base_url=self._ollama_base_url, timeout=timeout) as client:
+                        retry_response = await client.post("/api/chat", json=retry_payload)
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as error:
+                    raise OllamaUnavailableError(str(error)) from error
+                except httpx.HTTPError as error:
+                    raise OllamaUnavailableError(str(error)) from error
+
+                if retry_response.status_code < 400:
+                    response = retry_response
+                else:
+                    detail = retry_response.text.strip() or f"HTTP {retry_response.status_code}"
+
             if response.status_code in (400, 404):
                 lower_detail = detail.lower()
                 if "model" in lower_detail and ("not found" in lower_detail or "missing" in lower_detail):

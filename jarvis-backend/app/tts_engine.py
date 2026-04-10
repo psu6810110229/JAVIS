@@ -2,28 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import os
 from dataclasses import dataclass
-from typing import Iterable
+from pathlib import Path
 
-from elevenlabs import VoiceSettings
-from elevenlabs.client import ElevenLabs
+import requests
 
-from .config import load_project_env
-
-DEFAULT_ELEVENLABS_MODEL = "eleven_multilingual_v2"
-DEFAULT_ELEVENLABS_VOICE = "Adam"
-DEFAULT_STABILITY = 0.5
-DEFAULT_CLARITY = 0.75
-
-KNOWN_PREMIUM_MALE_VOICES: dict[str, str] = {
-    "adam": "pNInz6obpgDQGcFmaJgB",
-    "antoni": "ErXwobaYiN019PkySvjV",
-}
+KOKORO_URL = "http://kokoro:8880/v1/audio/speech"
+KOKORO_MODEL = "kokoro"
+KOKORO_VOICE = "bm_george"
+KOKORO_OUTPUT_PATH = Path("/tmp/jarvis_assistant_audio.mp3")
+KOKORO_TIMEOUT_SECONDS = 60
+KOKORO_LEADING_PAUSE = ", ... "
 
 
 class TtsEngineError(Exception):
-    """Raised when ElevenLabs TTS synthesis fails."""
+    """Raised when Kokoro TTS synthesis fails."""
 
 
 @dataclass(slots=True)
@@ -33,13 +26,9 @@ class TtsSynthesisPayload:
     voice: str
 
 
-class ElevenLabsTtsEngine:
+class KokoroTtsEngine:
     def __init__(self) -> None:
-        load_project_env()
-        self._api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
-        self._model_id = DEFAULT_ELEVENLABS_MODEL
-        self._voice_name = os.getenv("ELEVENLABS_VOICE", DEFAULT_ELEVENLABS_VOICE).strip() or DEFAULT_ELEVENLABS_VOICE
-        self._voice_id = self._resolve_voice_id(self._voice_name)
+        self._voice_name = KOKORO_VOICE
 
     @property
     def voice_label(self) -> str:
@@ -49,16 +38,14 @@ class ElevenLabsTtsEngine:
         if not text.strip():
             raise TtsEngineError("Cannot synthesize empty text.")
 
-        if not self._api_key:
-            raise TtsEngineError("ELEVENLABS_API_KEY is not configured.")
-
         try:
-            audio_bytes = await asyncio.to_thread(self._synthesize_sync, text)
+            prepared_text = self._with_leading_pause(text)
+            audio_bytes = await asyncio.to_thread(self._synthesize_sync, prepared_text)
         except Exception as error:  # noqa: BLE001
-            raise TtsEngineError("Jarvis could not generate ElevenLabs speech output.") from error
+            raise TtsEngineError("Jarvis could not generate Kokoro speech output.") from error
 
         if not audio_bytes:
-            raise TtsEngineError("ElevenLabs returned no audio data.")
+            raise TtsEngineError("Kokoro returned no audio data.")
 
         return TtsSynthesisPayload(
             audio_base64=base64.b64encode(audio_bytes).decode("utf-8"),
@@ -67,29 +54,21 @@ class ElevenLabsTtsEngine:
         )
 
     def _synthesize_sync(self, text: str) -> bytes:
-        client = ElevenLabs(api_key=self._api_key)
-        chunks: Iterable[bytes] = client.text_to_speech.convert(
-            text=text,
-            voice_id=self._voice_id,
-            model_id="eleven_multilingual_v2",
-            output_format="mp3_44100_128",
-            voice_settings=VoiceSettings(
-                stability=DEFAULT_STABILITY,
-                similarity_boost=DEFAULT_CLARITY,
-            ),
+        response = requests.post(
+            KOKORO_URL,
+            json={
+                "model": KOKORO_MODEL,
+                "input": text,
+                "voice": self._voice_name,
+            },
+            timeout=KOKORO_TIMEOUT_SECONDS,
         )
+        response.raise_for_status()
 
-        audio_buffer = bytearray()
-        for chunk in chunks:
-            if isinstance(chunk, (bytes, bytearray)):
-                audio_buffer.extend(chunk)
-
-        return bytes(audio_buffer)
+        KOKORO_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        KOKORO_OUTPUT_PATH.write_bytes(response.content)
+        return KOKORO_OUTPUT_PATH.read_bytes()
 
     @staticmethod
-    def _resolve_voice_id(voice_name_or_id: str) -> str:
-        normalized = voice_name_or_id.strip().lower()
-        if normalized in KNOWN_PREMIUM_MALE_VOICES:
-            return KNOWN_PREMIUM_MALE_VOICES[normalized]
-
-        return voice_name_or_id
+    def _with_leading_pause(text: str) -> str:
+        return f"{KOKORO_LEADING_PAUSE}{text}"
