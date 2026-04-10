@@ -48,6 +48,7 @@ class ChatRequestPayload(BaseModel):
     message: str = Field(min_length=1)
     auto_speak: bool = Field(default=True)
     session_id: str | None = None
+    num_ctx: int | None = Field(default=None, ge=128, le=4096)
 
 
 class SynthesizeRequestPayload(BaseModel):
@@ -141,10 +142,9 @@ async def get_system_status() -> dict[str, Any]:
 async def patch_system_model(payload: SystemModelPatchPayload) -> dict[str, Any]:
     try:
         result = await brain.set_active_mode(mode=payload.mode, prewarm=False)
-        asyncio.create_task(brain.prewarm_model_non_blocking(result["active_model"]))
-        result["prewarm_attempted"] = True
-        result["prewarm_warning"] = None
-        result["prewarm_started"] = True
+        result["prewarm_attempted"] = False
+        result["prewarm_warning"] = "Background prewarm disabled to prevent latency spikes on constrained hosts."
+        result["prewarm_started"] = False
         return result
     except OllamaModelError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
@@ -226,14 +226,11 @@ async def post_chat(payload: ChatRequestPayload) -> StreamingResponse:
             )
 
         async def produce() -> None:
-            try:
-                final_text = await brain.handle_http_chat_streaming(
-                    session_id=session_id,
-                    user_text=payload.message,
-                    auto_speak=payload.auto_speak,
-                    on_text_chunk=on_text_chunk,
-                    on_sentence_audio=on_sentence_audio,
-                )
+            final_event_sent = False
+
+            async def on_final_text(final_text: str) -> None:
+                nonlocal final_event_sent
+                final_event_sent = True
                 await queue.put(
                     {
                         "type": "final",
@@ -243,6 +240,27 @@ async def post_chat(payload: ChatRequestPayload) -> StreamingResponse:
                         "timestamp": utc_timestamp(),
                     }
                 )
+
+            try:
+                final_text = await brain.handle_http_chat_streaming(
+                    session_id=session_id,
+                    user_text=payload.message,
+                    auto_speak=payload.auto_speak,
+                    num_ctx_override=payload.num_ctx,
+                    on_text_chunk=on_text_chunk,
+                    on_sentence_audio=on_sentence_audio,
+                    on_final_text=on_final_text,
+                )
+                if not final_event_sent:
+                    await queue.put(
+                        {
+                            "type": "final",
+                            "stream_id": stream_id,
+                            "session_id": session_id,
+                            "text": final_text,
+                            "timestamp": utc_timestamp(),
+                        }
+                    )
             except (OllamaUnavailableError, OllamaModelError, OllamaResponseError) as error:
                 await queue.put(
                     {

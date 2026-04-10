@@ -25,11 +25,27 @@ type AssistantAudioPayload = {
   voice: string;
 };
 
+type SystemTelemetry = {
+  gpuLoad: number;
+  ramAvailableGb: number;
+  diskIoMBps: number;
+  telemetrySource: string;
+};
+
+type SystemCapabilities = {
+  numBatchSupported: boolean;
+  numBatchWarning: string;
+  hostOptimizerStatus: string;
+};
+
 const DEFAULT_WS_URL = "ws://127.0.0.1:8000/ws";
 const DEFAULT_API_URL = "http://127.0.0.1:8000";
 const POWER_MODE_STORAGE_KEY = "jarvis.power.mode";
 const VOICE_AUTO_SPEAK_STORAGE_KEY = "jarvis.voice.auto_speak";
 const PTT_HOTKEY = "Alt";
+const TURBO_MODE_THRESHOLD = 95;
+const EOF_RETRY_DELAY_MS = 500;
+const EOF_RETRY_NUM_CTX = 512;
 
 function readPersistedPowerMode(): PowerMode {
   const persisted = window.localStorage.getItem(POWER_MODE_STORAGE_KEY);
@@ -39,7 +55,7 @@ function readPersistedPowerMode(): PowerMode {
 function readPersistedVoiceAutoSpeak(): boolean {
   const persisted = window.localStorage.getItem(VOICE_AUTO_SPEAK_STORAGE_KEY);
   if (persisted === null) {
-    return true;
+    return false;
   }
 
   return persisted !== "off";
@@ -111,6 +127,17 @@ function App() {
   const [showModelContext, setShowModelContext] = useState<boolean>(false);
   const [transportNotice, setTransportNotice] = useState<string>("");
   const [manualListenMessageId, setManualListenMessageId] = useState<string>("");
+  const [telemetry, setTelemetry] = useState<SystemTelemetry>({
+    gpuLoad: 0,
+    ramAvailableGb: 0,
+    diskIoMBps: 0,
+    telemetrySource: "unavailable"
+  });
+  const [capabilities, setCapabilities] = useState<SystemCapabilities>({
+    numBatchSupported: true,
+    numBatchWarning: "",
+    hostOptimizerStatus: "unknown"
+  });
   const socketRef = useRef<WebSocket | null>(null);
   const chatAbortControllerRef = useRef<AbortController | null>(null);
   const activeHttpAssistantMessageIdRef = useRef<string | null>(null);
@@ -145,6 +172,74 @@ function App() {
     typeof MediaRecorder !== "undefined";
   const isRequestActive =
     pendingAssistantResponse || isTextStreaming || awaitingAssistantAudio || isPlayingAudio;
+
+  async function hydrateStatus(silentFailure: boolean = false): Promise<void> {
+    try {
+      const response = await fetch(`${apiBaseUrl}/v1/system/status`);
+      const payload = (await response.json()) as Record<string, unknown>;
+      if (!response.ok) {
+        throw new Error(
+          typeof payload.detail === "string"
+            ? payload.detail
+            : "Jarvis could not load system status."
+        );
+      }
+
+      const serverMode =
+        payload.active_mode === "performance" || payload.active_mode === "eco"
+          ? (payload.active_mode as PowerMode)
+          : "eco";
+      const serverModel = typeof payload.active_model === "string" ? payload.active_model : "";
+      setCurrentMode(serverMode);
+      setActiveModel(serverModel);
+      window.localStorage.setItem(POWER_MODE_STORAGE_KEY, serverMode);
+
+      const systemLoad =
+        typeof payload.system_load === "object" && payload.system_load !== null
+          ? (payload.system_load as Record<string, unknown>)
+          : {};
+
+      const gpuLoad = typeof systemLoad.GPU_Load === "number" ? systemLoad.GPU_Load : 0;
+      const ramAvailableGb = typeof systemLoad.RAM_Available === "number" ? systemLoad.RAM_Available : 0;
+      const diskIoMBps = typeof systemLoad.Disk_IO === "number" ? systemLoad.Disk_IO : 0;
+      const telemetrySource =
+        typeof systemLoad.telemetry_source === "string" ? systemLoad.telemetry_source : "unavailable";
+
+      const capabilityPayload =
+        typeof payload.capabilities === "object" && payload.capabilities !== null
+          ? (payload.capabilities as Record<string, unknown>)
+          : {};
+      const hostOptimizerPayload =
+        typeof capabilityPayload.host_optimizer === "object" && capabilityPayload.host_optimizer !== null
+          ? (capabilityPayload.host_optimizer as Record<string, unknown>)
+          : {};
+
+      setCapabilities({
+        numBatchSupported:
+          typeof capabilityPayload.num_batch_supported === "boolean"
+            ? capabilityPayload.num_batch_supported
+            : true,
+        numBatchWarning:
+          typeof capabilityPayload.num_batch_warning === "string" ? capabilityPayload.num_batch_warning : "",
+        hostOptimizerStatus:
+          typeof hostOptimizerPayload.status === "string" ? hostOptimizerPayload.status : "unknown"
+      });
+
+      setTelemetry({
+        gpuLoad,
+        ramAvailableGb,
+        diskIoMBps,
+        telemetrySource
+      });
+      setStatusLoadError("");
+    } catch (error: unknown) {
+      if (!silentFailure) {
+        setStatusLoadError(
+          error instanceof Error ? error.message : "Jarvis could not load the current power mode status."
+        );
+      }
+    }
+  }
 
   useEffect(() => {
     return () => {
@@ -240,44 +335,21 @@ function App() {
   useEffect(() => {
     let isDisposed = false;
 
-    async function hydrateStatus(): Promise<void> {
-      try {
-        const response = await fetch(`${apiBaseUrl}/v1/system/status`);
-        const payload = (await response.json()) as Record<string, unknown>;
-        if (!response.ok) {
-          throw new Error(
-            typeof payload.detail === "string"
-              ? payload.detail
-              : "Jarvis could not load system status."
-          );
-        }
-
-        if (isDisposed) {
-          return;
-        }
-
-        const serverMode =
-          payload.active_mode === "performance" || payload.active_mode === "eco"
-            ? (payload.active_mode as PowerMode)
-            : "eco";
-        const serverModel = typeof payload.active_model === "string" ? payload.active_model : "";
-        setCurrentMode(serverMode);
-        setActiveModel(serverModel);
-        window.localStorage.setItem(POWER_MODE_STORAGE_KEY, serverMode);
-        setStatusLoadError("");
-      } catch (error: unknown) {
-        if (isDisposed) {
-          return;
-        }
-        setStatusLoadError(
-          error instanceof Error ? error.message : "Jarvis could not load the current power mode status."
-        );
+    const runHydrate = async () => {
+      if (isDisposed) {
+        return;
       }
-    }
+      await hydrateStatus(false);
+    };
 
-    void hydrateStatus();
+    void runHydrate();
+    const intervalId = window.setInterval(() => {
+      void hydrateStatus(true);
+    }, 2000);
+
     return () => {
       isDisposed = true;
+      window.clearInterval(intervalId);
     };
   }, [apiBaseUrl]);
 
@@ -629,7 +701,12 @@ function App() {
     }
   }
 
-  async function streamChatOverHttp(userText: string, assistantMessageId: string): Promise<void> {
+  async function streamChatOverHttp(
+    userText: string,
+    assistantMessageId: string,
+    attempt: number = 0,
+    numCtxOverride?: number
+  ): Promise<void> {
     const requestController = new AbortController();
     chatAbortControllerRef.current = requestController;
     activeHttpAssistantMessageIdRef.current = assistantMessageId;
@@ -648,7 +725,8 @@ function App() {
         body: JSON.stringify({
           message: userText,
           auto_speak: voiceAutoSpeak,
-          session_id: sessionId || undefined
+          session_id: sessionId || undefined,
+          num_ctx: numCtxOverride
         }),
         signal: requestController.signal
       });
@@ -669,6 +747,7 @@ function App() {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let streamErrorMessage = "";
 
       while (true) {
         const { done, value } = await reader.read();
@@ -737,21 +816,35 @@ function App() {
           }
 
           if (eventType === "error") {
-            const message =
+            streamErrorMessage =
               typeof event.message === "string"
                 ? event.message
                 : "Jarvis encountered an unexpected streaming error.";
-            pushMessage({
-              id: `stream-error-${Date.now()}`,
-              role: "system",
-              label: "Error",
-              content: message
-            });
-            setPendingAssistantResponse(false);
-            setIsTextStreaming(false);
-            continue;
+            break;
           }
         }
+      }
+
+      if (streamErrorMessage) {
+        const normalized = streamErrorMessage.toLowerCase();
+        const isUnexpectedEof =
+          normalized.includes("unexpected eof") ||
+          normalized.includes("incomplete") ||
+          normalized.includes("connection reset");
+
+        if (isUnexpectedEof && attempt < 1) {
+          setTransportNotice("Stream interrupted. Retrying with low context...");
+          await new Promise((resolve) => window.setTimeout(resolve, EOF_RETRY_DELAY_MS));
+          await streamChatOverHttp(userText, assistantMessageId, attempt + 1, EOF_RETRY_NUM_CTX);
+          return;
+        }
+
+        pushMessage({
+          id: `stream-error-${Date.now()}`,
+          role: "system",
+          label: "Error",
+          content: streamErrorMessage
+        });
       }
     } catch (error: unknown) {
       const isAbortError = error instanceof DOMException && error.name === "AbortError";
@@ -1296,28 +1389,43 @@ function App() {
         className="mx-auto flex min-h-[calc(100vh-2.5rem)] w-full max-w-5xl flex-col rounded-2xl border border-[#222] bg-[#0f0f0f]"
       >
         <header className="flex items-center justify-between border-b border-[#222] px-4 py-3 sm:px-5">
-          <div className="flex min-h-[20px] items-center gap-2">
-            <span
-              className={`h-1.5 w-1.5 rounded-full ${
-                socketStatus === "connected"
-                  ? "bg-[#8ea7c4]"
-                  : socketStatus === "connecting"
-                    ? "bg-[#85725c]"
-                    : "bg-[#565656]"
-              }`}
-            />
-            {showModelContext || isSwitchingMode ? (
-              <p className="text-[12px] text-[#a7a7a7]">
-                Model: <span className="font-mono text-[11px] text-[#d2d2d2]">{activeModel || "updating"}</span>
+          <div className="flex min-h-[20px] flex-col items-start gap-1">
+            <div className="flex items-center gap-2">
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${
+                  socketStatus === "connected"
+                    ? "bg-[#8ea7c4]"
+                    : socketStatus === "connecting"
+                      ? "bg-[#85725c]"
+                      : "bg-[#565656]"
+                }`}
+              />
+              {showModelContext || isSwitchingMode ? (
+                <p className="text-[12px] text-[#a7a7a7]">
+                  Model: <span className="font-mono text-[11px] text-[#d2d2d2]">{activeModel || "updating"}</span>
+                </p>
+              ) : null}
+              {!showModelContext && !isSwitchingMode && transportNotice ? (
+                <p className="text-[12px] text-[#8e8e8e]">{transportNotice}</p>
+              ) : null}
+            </div>
+            <p className="text-[11px] text-[#7f7f7f]">
+              GPU: {Math.round(telemetry.gpuLoad)}% | RAM: {telemetry.ramAvailableGb.toFixed(2)} GB | Disk I/O: {telemetry.diskIoMBps.toFixed(2)} MB/s
+              {telemetry.telemetrySource !== "measured" ? ` (${telemetry.telemetrySource})` : ""}
+            </p>
+            {!capabilities.numBatchSupported || capabilities.hostOptimizerStatus !== "applied" ? (
+              <p className="text-[10px] text-[#6f6f6f]">
+                {capabilities.numBatchSupported ? "" : capabilities.numBatchWarning}
+                {capabilities.hostOptimizerStatus !== "applied"
+                  ? `${capabilities.numBatchSupported ? "" : " | "}Host optimizer: ${capabilities.hostOptimizerStatus}`
+                  : ""}
               </p>
-            ) : null}
-            {!showModelContext && !isSwitchingMode && transportNotice ? (
-              <p className="text-[12px] text-[#8e8e8e]">{transportNotice}</p>
             ) : null}
           </div>
           <PowerController
             currentMode={currentMode}
             isSwitchingMode={isSwitchingMode}
+            turboModeActive={telemetry.gpuLoad >= TURBO_MODE_THRESHOLD}
             onSwitch={(mode) => {
               void handleSwitchMode(mode);
             }}

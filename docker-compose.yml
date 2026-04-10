@@ -7,9 +7,14 @@ services:
     volumes:
       - ollama_data:/root/.ollama
     environment:
-      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-2}
+      OLLAMA_INTEL_GPU: ${OLLAMA_INTEL_GPU:-0}
+      OLLAMA_GPU: ${OLLAMA_GPU:-1}
+      OLLAMA_GPU_TARGETS: ${OLLAMA_GPU_TARGETS:-intel}
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
       OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:--1}
-      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-2}
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-1}
+      OLLAMA_INTEL_GPU_MEMORY: ${OLLAMA_INTEL_GPU_MEMORY:-4096}
+    mem_limit: "12g"
     restart: unless-stopped
 
   kokoro:
@@ -30,6 +35,11 @@ services:
     environment:
       JARVIS_MODEL_NAME: scb10x/llama3.1-typhoon2-8b-instruct
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      JARVIS_HOST_OPTIMIZER_URL: ${JARVIS_HOST_OPTIMIZER_URL:-}
+      JARVIS_TTS_BACKEND_MODE: ${JARVIS_TTS_BACKEND_MODE:-cpu-service}
+      JARVIS_TTS_URL: ${JARVIS_TTS_URL:-http://kokoro:8880/v1/audio/speech}
+      JARVIS_TTS_FALLBACK_URL: ${JARVIS_TTS_FALLBACK_URL:-http://kokoro:8880/v1/audio/speech}
+      JARVIS_TTS_SPEED: ${JARVIS_TTS_SPEED:-1.2}
     ports:
       - "8000:8000"
     volumes:
