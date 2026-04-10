@@ -26,6 +26,7 @@ import asyncio
 import base64
 import binascii
 import io
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -47,6 +48,7 @@ from app.brain.exceptions import (
     OllamaUnavailableError,
 )
 from app.brain.memory import SessionMemory
+from app.brain.memory_guardian import GuardianDecision, MemoryGuardian
 from app.brain.models import (
     AssistantAudioPayload,
     AudioChunkAcknowledgement,
@@ -79,6 +81,9 @@ from app.config.settings import (
 from app.tts.host_client import TtsEngineError, TtsHostClient
 
 logger = logging.getLogger(__name__)
+
+_MAX_TOOL_CALL_ROUNDS = 2
+_MAX_TOOL_RESULT_CHARS = 900
 
 _SYSTEM_INSTRUCTION = (
     "You are Jarvis. Stay polite, concise, and use a British professional tone. "
@@ -137,6 +142,11 @@ class Orchestrator:
         self._last_disk_io_bytes: int | None = None
         self._last_disk_io_monotonic: float = 0.0
         self._metrics_lock = asyncio.Lock()
+        self._memory_guardian = MemoryGuardian(
+            low_ram_force_eco_bytes=self._low_ram_force_eco_bytes,
+            high_swap_force_eco_percent=self._high_swap_force_eco_percent,
+            pagefile_guardrail_percent=self._pagefile_guardrail_percent,
+        )
 
     # ------------------------------------------------------------------
     # Public properties
@@ -213,11 +223,15 @@ class Orchestrator:
             self._memory.append_user(session_id, user_text)
             model_name, profile = self._resolve_model_and_profile()
             try:
-                response_text = await self._ollama.generate(
-                    self._memory.get_messages(session_id) or [],
-                    model_name,
-                    profile,
-                    num_gpu=self._resolve_num_gpu(profile.mode),
+                await self._enforce_pressure_guardrail(model_name)
+                await self._invoke_host_optimizer(model_name=model_name, mode=profile.mode)
+                session_messages = [
+                    dict(message) for message in (self._memory.get_messages(session_id) or [])
+                ]
+                response_text = await self._generate_with_tool_loop(
+                    messages=session_messages,
+                    model_name=model_name,
+                    profile=profile,
                 )
                 self._memory.append_assistant(session_id, response_text)
                 self._ollama_available = True
@@ -234,6 +248,172 @@ class Orchestrator:
                 return BrainResponse(text=str(err), tool_schemas=self.tool_schemas)
 
         return await self._attach_audio(BrainResponse(text=response_text, tool_schemas=self.tool_schemas))
+
+    def _build_tool_protocol_prompt(self) -> str:
+        lines: list[str] = []
+        for schema in self.tool_schemas:
+            props = schema.parameters.get("properties", {})
+            arg_names = ",".join(str(k) for k in props.keys())
+            lines.append(f"- {schema.name}({arg_names})")
+
+        tools_text = "\n".join(lines) if lines else "- (no tools available)"
+        return (
+            "Tool protocol for this turn:\n"
+            "If a tool is required, output only compact JSON with no markdown: "
+            '{"t":"tool","n":"tool_name","a":{}}.\n'
+            "If no tool is required, answer naturally in plain text.\n"
+            "Available tools:\n"
+            f"{tools_text}"
+        )
+
+    def _inject_tool_protocol(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        protocol_message = {"role": "system", "content": self._build_tool_protocol_prompt()}
+        if messages and messages[0].get("role") == "system":
+            return [messages[0], protocol_message, *messages[1:]]
+        return [protocol_message, *messages]
+
+    @staticmethod
+    def _extract_tool_call(response_text: str) -> tuple[str, dict[str, Any]] | None:
+        payload = response_text.strip()
+        if not payload:
+            return None
+
+        if payload.startswith("```"):
+            payload = "\n".join(
+                line for line in payload.splitlines() if not line.strip().startswith("```")
+            ).strip()
+
+        decoder = json.JSONDecoder()
+        candidate: dict[str, Any] | None = None
+
+        for start_index in [0, payload.find("{")]:
+            if start_index < 0:
+                continue
+            try:
+                decoded, _ = decoder.raw_decode(payload[start_index:])
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(decoded, dict):
+                candidate = decoded
+                break
+
+        if not isinstance(candidate, dict):
+            return None
+        if candidate.get("t") != "tool":
+            return None
+
+        tool_name = candidate.get("n")
+        tool_args = candidate.get("a", {})
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            return None
+        if not isinstance(tool_args, dict):
+            return None
+        return tool_name.strip(), tool_args
+
+    @staticmethod
+    def _format_tool_result(result: Any) -> str:
+        try:
+            text = json.dumps(result, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(result)
+        if len(text) > _MAX_TOOL_RESULT_CHARS:
+            return text[:_MAX_TOOL_RESULT_CHARS] + " ...[truncated]"
+        return text
+
+    async def _assess_tool_call(self, tool_name: str, active_mode: str) -> GuardianDecision:
+        metadata = tool_registry.get_metadata(tool_name)
+        runtime_metrics = await self._collect_runtime_metrics()
+        return self._memory_guardian.assess(
+            tool_name=tool_name,
+            tool_metadata=metadata,
+            active_mode=active_mode,
+            runtime_metrics=runtime_metrics,
+        )
+
+    @staticmethod
+    def _guardian_message(decision: GuardianDecision) -> str:
+        if decision.requires_mode_confirmation and decision.suggested_mode:
+            return (
+                f"I need your confirmation to switch to {decision.suggested_mode} mode "
+                f"before I run '{decision.tool_name}'."
+            )
+        return decision.reason + " Please free memory and retry."
+
+    async def _generate_with_tool_loop(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        model_name: str,
+        profile: Any,
+    ) -> str:
+        working_messages = [dict(message) for message in messages]
+
+        for _ in range(_MAX_TOOL_CALL_ROUNDS + 1):
+            protocol_messages = self._inject_tool_protocol(working_messages)
+            response_text = await self._ollama.generate(
+                protocol_messages,
+                model_name,
+                profile,
+                num_gpu=self._resolve_num_gpu(profile.mode),
+            )
+            parsed = self._extract_tool_call(response_text)
+            if parsed is None:
+                return response_text.strip()
+
+            tool_name, tool_args = parsed
+            if not tool_registry.has_tool(tool_name):
+                working_messages.append(
+                    {"role": "assistant", "content": f"Tool '{tool_name}' is unavailable."}
+                )
+                working_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "That tool is unavailable. Continue without tools and "
+                            "answer naturally."
+                        ),
+                    }
+                )
+                continue
+
+            decision = await self._assess_tool_call(tool_name=tool_name, active_mode=profile.mode)
+            if not decision.allowed:
+                return self._guardian_message(decision)
+
+            try:
+                tool_result = await tool_registry.execute(tool_name, tool_args)
+            except (KeyError, ValueError, RuntimeError) as err:
+                working_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"Tool '{tool_name}' failed with error: {err}",
+                    }
+                )
+                working_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Tool execution failed. Continue without that tool and "
+                            "answer naturally."
+                        ),
+                    }
+                )
+                continue
+
+            result_text = self._format_tool_result(tool_result)
+            working_messages.append({"role": "assistant", "content": f"Tool '{tool_name}' executed."})
+            working_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Tool result ({tool_name}): {result_text}. "
+                        "Continue and answer the original request naturally. "
+                        "Do not output JSON."
+                    ),
+                }
+            )
+
+        return "I could not complete the request safely within the local tool-call limit."
 
     # ------------------------------------------------------------------
     # WebSocket streaming text inference
