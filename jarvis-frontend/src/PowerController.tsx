@@ -3,12 +3,14 @@ type PowerMode = "eco" | "performance";
 type PowerControllerProps = {
   currentMode: PowerMode;
   isSwitchingMode: boolean;
+  turboModeActive?: boolean;
   onSwitch: (mode: PowerMode) => void;
 };
 
 function PowerController({
   currentMode,
   isSwitchingMode,
+  turboModeActive = false,
   onSwitch
 }: PowerControllerProps) {
   const isEco = currentMode === "eco";
@@ -52,6 +54,12 @@ function PowerController({
 
       {isSwitchingMode && (
         <div className="px-2 text-[11px] text-[#8f8f8f]">Reconfiguring...</div>
+      )}
+
+      {!isSwitchingMode && (
+        <div className={`px-2 text-[11px] ${turboModeActive ? "text-[#e9d8b2]" : "text-[#6f6f6f]"}`}>
+          {turboModeActive ? "Turbo Mode: ACTIVE" : "Turbo Mode: standby"}
+        </div>
       )}
     </section>
   );
