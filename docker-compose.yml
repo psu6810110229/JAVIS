@@ -1,4 +1,5 @@
 services:
+  # ─── Ollama (LLM inference) ───────────────────────────────────────────────
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
@@ -7,23 +8,30 @@ services:
     volumes:
       - ollama_data:/root/.ollama
     environment:
+      # Intel iGPU via Vulkan/oneAPI (set to 1 to enable)
       OLLAMA_INTEL_GPU: ${OLLAMA_INTEL_GPU:-0}
       OLLAMA_GPU: ${OLLAMA_GPU:-1}
       OLLAMA_GPU_TARGETS: ${OLLAMA_GPU_TARGETS:-intel}
+      # Single model in memory at a time — critical for 16GB RAM
       OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
-      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:--1}
       OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-1}
+      # Keep model loaded indefinitely (-1) to avoid cold-start latency
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:--1}
       OLLAMA_INTEL_GPU_MEMORY: ${OLLAMA_INTEL_GPU_MEMORY:-4096}
+    # Reserve up to 12GB for LLM; OS + UI + TTS share remaining 4GB
     mem_limit: "12g"
     restart: unless-stopped
 
+  # ─── Kokoro TTS (CPU service fallback) ────────────────────────────────────
   kokoro:
     image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
     container_name: kokoro
     ports:
       - "8880:8880"
+    # TTS is I/O-bound; no mem_limit needed for CPU service
     restart: unless-stopped
 
+  # ─── Jarvis Backend ────────────────────────────────────────────────────────
   jarvis-backend:
     build:
       context: ./jarvis-backend
@@ -33,13 +41,38 @@ services:
       - ollama
       - kokoro
     environment:
-      JARVIS_MODEL_NAME: scb10x/llama3.1-typhoon2-8b-instruct
+      # ── Model configuration ──────────────────────────────────────────────
+      # Performance model: Typhoon 8B — high-quality, uses ~8GB
+      JARVIS_MODEL_PERFORMANCE: ${JARVIS_MODEL_PERFORMANCE:-scb10x/llama3.1-typhoon2-8b-instruct}
+      # Eco model: Typhoon 4B — lighter, faster, uses ~3GB
+      JARVIS_MODEL_ECO: ${JARVIS_MODEL_ECO:-scb10x/typhoon2.5-qwen3-4b}
+
+      # ── Ollama connection ────────────────────────────────────────────────
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
-      JARVIS_HOST_OPTIMIZER_URL: ${JARVIS_HOST_OPTIMIZER_URL:-}
+      OLLAMA_INTEL_GPU: ${OLLAMA_INTEL_GPU:-0}
+
+      # ── Hardware profiles (overrides built-in defaults) ──────────────────
+      # num_ctx: 1024 (strict Memory Shield for performance mode)
+      # num_thread: 8  (Performance), 2 (Eco) — set in config/settings.py
+      # Override only if you know what you are doing:
+      # JARVIS_NUM_CTX_PERFORMANCE: 1024
+      # JARVIS_NUM_THREAD_PERFORMANCE: 8
+      # JARVIS_NUM_CTX_ECO: 1536
+      # JARVIS_NUM_THREAD_ECO: 2
+
+      # ── TTS configuration ────────────────────────────────────────────────
       JARVIS_TTS_BACKEND_MODE: ${JARVIS_TTS_BACKEND_MODE:-cpu-service}
-      JARVIS_TTS_URL: ${JARVIS_TTS_URL:-http://kokoro:8880/v1/audio/speech}
+      # Primary: DML host worker (iGPU/CPU ONNX on Windows host)
+      JARVIS_TTS_URL: ${JARVIS_TTS_URL:-http://host.docker.internal:8870/v1/audio/speech}
+      # Fallback: CPU Kokoro container
       JARVIS_TTS_FALLBACK_URL: ${JARVIS_TTS_FALLBACK_URL:-http://kokoro:8880/v1/audio/speech}
       JARVIS_TTS_SPEED: ${JARVIS_TTS_SPEED:-1.2}
+      JARVIS_TTS_TIMEOUT_SECONDS: ${JARVIS_TTS_TIMEOUT_SECONDS:-60}
+
+      # ── Host optimizer (Standby List flusher) ───────────────────────────
+      JARVIS_HOST_OPTIMIZER_URL: ${JARVIS_HOST_OPTIMIZER_URL:-}
+      JARVIS_HOST_OPTIMIZER_TIMEOUT_SECONDS: ${JARVIS_HOST_OPTIMIZER_TIMEOUT_SECONDS:-0.35}
+
     ports:
       - "8000:8000"
     volumes:
