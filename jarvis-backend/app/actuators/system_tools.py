@@ -45,6 +45,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import difflib
 import psutil
 
 from app.actuators.registry import tool
@@ -67,20 +68,36 @@ _EXCLUDED_DIRS = {
     ".cache",
 }
 
-_OPEN_APP_WHITELIST: dict[str, str] = {
+_OPEN_APP_MAP: dict[str, str] = {
     "notepad": "notepad.exe",
-    "vscode": "code",
+    "vscode": "code.cmd",
+    "visual studio code": "code.cmd",
+    "code": "code.cmd",
     "chrome": "chrome.exe",
+    "google": "chrome.exe",
+    "google chrome": "chrome.exe",
     "word": "winword.exe",
+    "winword": "winword.exe",
+    "microsoft word": "winword.exe",
     "excel": "excel.exe",
+    "microsoft excel": "excel.exe",
+    "powerpnt": "powerpnt.exe",
+    "powerpoint": "powerpnt.exe",
+    "microsoft powerpoint": "powerpnt.exe",
+    "point": "powerpnt.exe",
     "explorer": "explorer.exe",
+    "file explorer": "explorer.exe",
     "paint": "mspaint.exe",
+    "mspaint": "mspaint.exe",
     "calculator": "calc.exe",
+    "calc": "calc.exe",
     "terminal": "wt.exe",
+    "windows terminal": "wt.exe",
+    "cmd": "cmd.exe",
     "taskmgr": "taskmgr.exe",
+    "task manager": "taskmgr.exe",
 }
-_ALLOWED_APPS_STR = ", ".join(_OPEN_APP_WHITELIST.keys())
-
+_ALLOWED_APPS_STR = "notepad, vscode, chrome, word, excel, powerpoint, explorer, paint, calculator, terminal, taskmgr, cmd"
 
 def _collect_top_processes(limit: int = 3) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     candidates: list[psutil.Process] = []
@@ -177,21 +194,27 @@ def _windows_battery_percent_fallback() -> float | None:
 
 
 def _resolve_battery_status() -> dict[str, Any]:
-    battery = psutil.sensors_battery()
-    if battery is not None:
-        return {
-            "battery_percent": float(battery.percent),
-            "battery_source": "psutil",
-            "battery_state": "charging" if bool(battery.power_plugged) else "discharging",
-        }
+    try:
+        battery = psutil.sensors_battery()
+        if battery is not None:
+            return {
+                "battery_percent": float(battery.percent),
+                "battery_source": "psutil",
+                "battery_state": "charging" if bool(battery.power_plugged) else "discharging",
+            }
+    except Exception:
+        pass
 
-    fallback_percent = _windows_battery_percent_fallback()
-    if fallback_percent is not None:
-        return {
-            "battery_percent": float(fallback_percent),
-            "battery_source": "windows-native",
-            "battery_state": "unknown",
-        }
+    try:
+        fallback_percent = _windows_battery_percent_fallback()
+        if fallback_percent is not None:
+            return {
+                "battery_percent": float(fallback_percent),
+                "battery_source": "windows-native",
+                "battery_state": "unknown",
+            }
+    except Exception:
+        pass
 
     return {
         "battery_percent": "AC Power / No Battery Detected",
@@ -412,8 +435,8 @@ def list_project_files(max_entries: int = 200, max_depth: int = 3) -> dict[str, 
     }
 
 
-def _resolve_app_path(app_cmd: str, app_key: str) -> str:
-    """Attempt to find the full path for common Windows applications."""
+def _resolve_app_path(app_cmd: str, app_key: str) -> str | None:
+    """Attempt to find the full path for common Windows applications. Return None if not found."""
     if os.path.exists(app_cmd):
         return app_cmd
         
@@ -428,47 +451,52 @@ def _resolve_app_path(app_cmd: str, app_key: str) -> str:
     local_app_data = os.environ.get("LOCALAPPDATA", "")
 
     search_paths = []
-    if app_key == "chrome":
+    if app_key in ("chrome", "google", "google chrome"):
         search_paths = [
             f"{program_files}\\Google\\Chrome\\Application\\chrome.exe",
             f"{program_files_x86}\\Google\\Chrome\\Application\\chrome.exe",
         ]
-    elif app_key == "vscode":
+    elif app_key in ("vscode", "code", "visual studio code"):
         search_paths = [
             f"{program_files}\\Microsoft VS Code\\bin\\code.cmd",
             f"{local_app_data}\\Programs\\Microsoft VS Code\\bin\\code.cmd",
         ]
-    elif app_key == "word":
+    elif app_key in ("word", "winword", "microsoft word"):
         search_paths = [
              f"{program_files}\\Microsoft Office\\root\\Office16\\WINWORD.EXE",
              f"{program_files_x86}\\Microsoft Office\\root\\Office16\\WINWORD.EXE",
         ]
-    elif app_key == "excel":
+    elif app_key in ("excel", "microsoft excel"):
         search_paths = [
              f"{program_files}\\Microsoft Office\\root\\Office16\\EXCEL.EXE",
              f"{program_files_x86}\\Microsoft Office\\root\\Office16\\EXCEL.EXE",
         ]
-    elif app_key == "terminal":
+    elif app_key in ("powerpnt", "powerpoint", "microsoft powerpoint"):
+        search_paths = [
+             f"{program_files}\\Microsoft Office\\root\\Office16\\POWERPNT.EXE",
+             f"{program_files_x86}\\Microsoft Office\\root\\Office16\\POWERPNT.EXE",
+        ]
+    elif app_key in ("terminal", "windows terminal"):
          search_paths = [f"{local_app_data}\\Microsoft\\WindowsApps\\wt.exe"]
 
     for path in search_paths:
         if os.path.exists(path):
             return path
             
-    return app_cmd
+    return None
 
 @tool(
     name="open_local_app",
     description=(
-        f"Launch an approved local application safely using a strict whitelist. "
-        f"Supported apps: {_ALLOWED_APPS_STR}."
+        f"Launch an approved local application safely using fuzzy name matching. "
+        f"Known apps: {_ALLOWED_APPS_STR}. You can try others, but they might be blocked."
     ),
     parameters={
         "type": "object",
         "properties": {
             "app_name": {
                 "type": "string",
-                "description": f"App identifier to launch. Allowed values: {_ALLOWED_APPS_STR}.",
+                "description": f"App identifier or name to launch (e.g., 'word', 'powerpoint', 'chrome'). Can be a fuzzy match.",
             }
         },
         "required": ["app_name"],
@@ -479,44 +507,54 @@ def _resolve_app_path(app_cmd: str, app_key: str) -> str:
     risk_level="medium",
     category="system",
 )
-def open_local_app(app_name: str) -> dict[str, Any]:
-    """Launch a whitelisted local app with path resolution leverage."""
+def open_local_app(app_name: str) -> str:
+    """Launch a whitelisted local app with fuzzy path resolution."""
     key = app_name.strip().lower()
-    if key not in _OPEN_APP_WHITELIST:
-        return {
-            "launched": False,
-            "app": key,
-            "error": f"App is not allowed. Allowed: {_ALLOWED_APPS_STR}.",
-        }
+    
+    # Fuzzy match
+    matched_key = None
+    if key in _OPEN_APP_MAP:
+        matched_key = key
+    else:
+        close_matches = difflib.get_close_matches(key, _OPEN_APP_MAP.keys(), n=1, cutoff=0.5)
+        if close_matches:
+            matched_key = close_matches[0]
 
-    raw_cmd = _OPEN_APP_WHITELIST[key]
-    app_cmd = _resolve_app_path(raw_cmd, key)
+    if not matched_key:
+        return f"Execution Failed: '{app_name}' is not recognized or allowed."
+
+    raw_cmd = _OPEN_APP_MAP[matched_key]
+    app_cmd = _resolve_app_path(raw_cmd, matched_key)
+
+    if not app_cmd:
+        return f"Execution Failed: '{app_name}' not found in system PATH."
 
     try:
+        kwargs = {
+            "close_fds": True,
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
         if os.name == "nt":
-            # For .cmd/.bat files (like VS Code), startfile can be tricky, so we use Popen shell=True
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            kwargs["creationflags"] = flags
+            
             if app_cmd.lower().endswith((".cmd", ".bat")):
-                subprocess.Popen(app_cmd, shell=True)
+                subprocess.Popen(app_cmd, shell=True, **kwargs)
             else:
                 try:
                     os.startfile(app_cmd)
-                except FileNotFoundError:
-                    subprocess.Popen(app_cmd, shell=True)
+                except Exception:
+                    subprocess.Popen(app_cmd, shell=True, **kwargs)
         else:
-            subprocess.Popen(app_cmd, shell=True)
+            kwargs["start_new_session"] = True
+            subprocess.Popen(app_cmd, shell=True, **kwargs)
     except Exception as err:
         logger.warning("Failed to launch app '%s' (resolved to '%s'): %s", key, app_cmd, err)
-        return {
-            "launched": False,
-            "app": key,
-            "error": str(err),
-        }
+        return f"Execution Failed: {str(err)}"
 
-    return {
-        "launched": True,
-        "app": key,
-        "command": app_cmd,
-    }
+    return f"Successfully opened {app_name}"
 
 
 @tool(

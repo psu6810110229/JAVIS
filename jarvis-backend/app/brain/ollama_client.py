@@ -281,13 +281,14 @@ class OllamaClient:
 
     async def generate(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         model_name: str,
         profile: HardwareProfile,
         *,
         num_gpu: int = 0,
-    ) -> str:
-        """POST /api/chat (stream=False). Returns completed assistant text."""
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, list[dict[str, Any]] | None]:
+        """POST /api/chat (stream=False). Returns completed assistant text and tool calls."""
         request_payload = {
             "model": model_name,
             "messages": messages,
@@ -299,6 +300,8 @@ class OllamaClient:
                 num_gpu=num_gpu,
             ),
         }
+        if tools:
+            request_payload["tools"] = tools
 
         try:
             response = await self._client().post("/api/chat", json=request_payload)
@@ -320,9 +323,9 @@ class OllamaClient:
                     "Ollama runtime does not support 4-bit KV cache. Continuing without."
                 )
                 logger.warning(self._kv_cache_warning)
-                return await self.generate(messages, model_name, profile, num_gpu=num_gpu)
+                return await self.generate(messages, model_name, profile, num_gpu=num_gpu, tools=tools)
             if self._is_memory_pressure(detail):
-                return await self.generate(messages, model_name, FALLBACK_PROFILE, num_gpu=0)
+                return await self.generate(messages, model_name, FALLBACK_PROFILE, num_gpu=0, tools=tools)
             self._raise_from_detail(response.status_code, detail)
 
         return self._parse_content(response.json())
@@ -333,7 +336,7 @@ class OllamaClient:
 
     async def generate_streaming(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         model_name: str,
         profile: HardwareProfile,
         on_delta: Callable[[str], Awaitable[None]],
@@ -343,7 +346,8 @@ class OllamaClient:
         allow_eof_retry: bool = True,
         allow_model_fallback: bool = True,
         _fallback_profile: bool = False,
-    ) -> str:
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, list[dict[str, Any]] | None]:
         """POST /api/chat (stream=True). Calls *on_delta* for each token chunk.
 
         Returns the full accumulated text.
@@ -371,12 +375,15 @@ class OllamaClient:
                 num_gpu=num_gpu,
             ),
         }
+        if tools:
+            request_payload["tools"] = tools
 
         try:
             t_start = time.monotonic()
             first_token_logged = False
             accumulated = ""
             think_filter = ThinkTagFilter(on_delta)
+            collected_tool_calls: list[dict[str, Any]] = []
 
             async with self._client().stream("POST", "/api/chat", json=request_payload) as response:
                 if response.status_code >= 400:
@@ -393,6 +400,7 @@ class OllamaClient:
                             allow_eof_retry=allow_eof_retry,
                             allow_model_fallback=allow_model_fallback,
                             _fallback_profile=_fallback_profile,
+                            tools=tools,
                         )
 
                     if self._is_memory_pressure(detail) and not _fallback_profile:
@@ -403,6 +411,7 @@ class OllamaClient:
                             allow_eof_retry=allow_eof_retry,
                             allow_model_fallback=allow_model_fallback,
                             _fallback_profile=True,
+                            tools=tools,
                         )
 
                     if self._is_memory_pressure(detail) and _fallback_profile and allow_model_fallback:
@@ -417,6 +426,7 @@ class OllamaClient:
                                 num_gpu=0, allow_eof_retry=allow_eof_retry,
                                 allow_model_fallback=False,
                                 _fallback_profile=True,
+                                tools=tools,
                             )
 
                     self._raise_from_detail(response.status_code, detail)
@@ -439,6 +449,10 @@ class OllamaClient:
 
                         msg = payload.get("message")
                         if isinstance(msg, dict):
+                            chunk_tools = msg.get("tool_calls")
+                            if chunk_tools:
+                                collected_tool_calls.extend(chunk_tools)
+
                             chunk: str = msg.get("content") or ""
                             if chunk:
                                 if not first_token_logged:
@@ -463,6 +477,7 @@ class OllamaClient:
                             num_ctx_override=FALLBACK_PROFILE.num_ctx,
                             allow_eof_retry=False,
                             allow_model_fallback=allow_model_fallback,
+                            tools=tools,
                         )
                     raise OllamaUnavailableError(
                         self._http_error_message(err, "streaming response from Ollama ended unexpectedly")
@@ -475,7 +490,7 @@ class OllamaClient:
             clean_accumulated = re.sub(r"<think>.*?</think>", "", accumulated, flags=re.DOTALL).strip()
 
             # Empty response retry
-            if not clean_accumulated:
+            if not clean_accumulated and not collected_tool_calls:
                 if allow_eof_retry:
                     await asyncio.sleep(DEFAULT_EOF_RETRY_DELAY_SECONDS)
                     return await self.generate_streaming(
@@ -484,10 +499,11 @@ class OllamaClient:
                         num_ctx_override=FALLBACK_PROFILE.num_ctx,
                         allow_eof_retry=False,
                         allow_model_fallback=allow_model_fallback,
+                        tools=tools,
                     )
-                raise OllamaResponseError("assistant message content is empty")
+                raise OllamaResponseError("assistant message content is empty and no tool calls received")
 
-            return clean_accumulated
+            return clean_accumulated, collected_tool_calls if collected_tool_calls else None
 
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as err:
             raise OllamaUnavailableError(
@@ -561,7 +577,7 @@ class OllamaClient:
         return "unexpected eof" in n or "incomplete" in n or "connection reset" in n
 
     @staticmethod
-    def _parse_content(payload: Any) -> str:
+    def _parse_content(payload: Any) -> tuple[str, list[dict[str, Any]] | None]:
         if not isinstance(payload, dict):
             raise OllamaResponseError("response payload is not a dict")
         payload_error = payload.get("error")
@@ -570,14 +586,17 @@ class OllamaClient:
         msg = payload.get("message")
         if not isinstance(msg, dict):
             raise OllamaResponseError("missing message object")
-        content = msg.get("content")
-        if not isinstance(content, str) or not content.strip():
-            raise OllamaResponseError("assistant message content is empty")
+            
+        content = msg.get("content") or ""
+        tool_calls = msg.get("tool_calls")
+        
         # Strip Qwen-family <think>...</think> reasoning blocks
         cleaned = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-        if not cleaned:
-            raise OllamaResponseError("assistant message content is empty after stripping thinking tags")
-        return cleaned
+        
+        if not cleaned and not tool_calls:
+            raise OllamaResponseError("assistant message content is empty and no tool calls")
+            
+        return cleaned, tool_calls
 
     def _raise_from_detail(self, status_code: int, detail: str) -> None:
         """Raise the appropriate exception based on the error detail."""

@@ -262,85 +262,18 @@ class Orchestrator:
 
         return await self._attach_audio(BrainResponse(text=response_text, tool_schemas=self.tool_schemas))
 
-    @staticmethod
-    def _format_mode_label(mode: str) -> str:
-        normalized = (mode or "").strip().lower()
-        if normalized == "performance":
-            return "Performance"
-        if normalized == "eco":
-            return "Eco"
-        return mode or "Unknown"
-
-    def _build_tool_protocol_prompt(self, current_mode: str) -> str:
-        lines: list[str] = []
+    def _get_ollama_tools(self) -> list[dict[str, Any]]:
+        tools = []
         for schema in self.tool_schemas:
-            props = schema.parameters.get("properties", {})
-            arg_names = ",".join(str(k) for k in props.keys())
-            lines.append(f"- {schema.name}({arg_names})")
-
-        tools_text = "\n".join(lines) if lines else "- (no tools available)"
-        mode_label = self._format_mode_label(current_mode)
-        return (
-            "Tool protocol for this turn:\n"
-            f"You are currently in {mode_label} mode.\n"
-            "Do not invent or assume reasons for missing data based on your mode.\n"
-            "If a tool is required, output only compact JSON with no markdown: "
-            '{"t":"tool","n":"tool_name","a":{}}.\n'
-            "If no tool is required, answer naturally in plain text.\n"
-            "Available tools:\n"
-            f"{tools_text}"
-        )
-
-    def _inject_tool_protocol(
-        self,
-        messages: list[dict[str, str]],
-        current_mode: str,
-    ) -> list[dict[str, str]]:
-        protocol_message = {
-            "role": "system",
-            "content": self._build_tool_protocol_prompt(current_mode=current_mode),
-        }
-        if messages and messages[0].get("role") == "system":
-            return [messages[0], protocol_message, *messages[1:]]
-        return [protocol_message, *messages]
-
-    @staticmethod
-    def _extract_tool_call(response_text: str) -> tuple[str, dict[str, Any]] | None:
-        payload = response_text.strip()
-        if not payload:
-            return None
-
-        if payload.startswith("```"):
-            payload = "\n".join(
-                line for line in payload.splitlines() if not line.strip().startswith("```")
-            ).strip()
-
-        decoder = json.JSONDecoder()
-        candidate: dict[str, Any] | None = None
-
-        for start_index in [0, payload.find("{")]:
-            if start_index < 0:
-                continue
-            try:
-                decoded, _ = decoder.raw_decode(payload[start_index:])
-            except (ValueError, json.JSONDecodeError):
-                continue
-            if isinstance(decoded, dict):
-                candidate = decoded
-                break
-
-        if not isinstance(candidate, dict):
-            return None
-        if candidate.get("t") != "tool":
-            return None
-
-        tool_name = candidate.get("n")
-        tool_args = candidate.get("a", {})
-        if not isinstance(tool_name, str) or not tool_name.strip():
-            return None
-        if not isinstance(tool_args, dict):
-            return None
-        return tool_name.strip(), tool_args
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": schema.name,
+                    "description": schema.description,
+                    "parameters": schema.parameters,
+                }
+            })
+        return tools
 
     @staticmethod
     def _format_tool_result(result: Any) -> str:
@@ -388,95 +321,51 @@ class Orchestrator:
     async def _generate_with_tool_loop(
         self,
         *,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         model_name: str,
         profile: Any,
     ) -> str:
         working_messages = [dict(message) for message in messages]
-        original_user_request = next(
-            (
-                str(message.get("content", "")).strip()
-                for message in reversed(messages)
-                if message.get("role") == "user" and str(message.get("content", "")).strip()
-            ),
-            "",
-        )
+        ollama_tools = self._get_ollama_tools()
 
         for _ in range(_MAX_TOOL_CALL_ROUNDS + 1):
-            protocol_messages = self._inject_tool_protocol(
+            response_text, tool_calls = await self._ollama.generate(
                 working_messages,
-                current_mode=profile.mode,
-            )
-            response_text = await self._ollama.generate(
-                protocol_messages,
                 model_name,
                 profile,
                 num_gpu=self._resolve_num_gpu(profile.mode),
+                tools=ollama_tools,
             )
-            response_text = self._strip_thinking_tags(response_text)
-            parsed = self._extract_tool_call(response_text)
-            if parsed is None:
+            
+            if not tool_calls:
                 return response_text.strip()
+                
+            working_messages.append({
+                "role": "assistant",
+                "content": response_text,
+                "tool_calls": tool_calls
+            })
+            
+            for tool_call in tool_calls:
+                func_data = tool_call.get("function", {})
+                tool_name = func_data.get("name")
+                tool_args = func_data.get("arguments", {})
+                
+                if not tool_registry.has_tool(tool_name):
+                    working_messages.append({"role": "tool", "name": tool_name, "content": "Tool unavailable."})
+                    continue
 
-            tool_name, tool_args = parsed
-            if not tool_registry.has_tool(tool_name):
-                working_messages.append(
-                    {"role": "assistant", "content": f"Tool '{tool_name}' is unavailable."}
-                )
-                working_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "That tool is unavailable. Continue without tools and "
-                            "answer naturally."
-                        ),
-                    }
-                )
-                continue
+                decision = await self._assess_tool_call(tool_name=tool_name, active_mode=profile.mode)
+                if not decision.allowed:
+                    working_messages.append({"role": "tool", "name": tool_name, "content": f"Blocked: {decision.reason}"})
+                    continue
 
-            decision = await self._assess_tool_call(tool_name=tool_name, active_mode=profile.mode)
-            if not decision.allowed:
-                return self._guardian_message(decision)
-
-            try:
-                tool_result = await tool_registry.execute(tool_name, tool_args)
-            except (KeyError, ValueError, RuntimeError) as err:
-                working_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": f"Tool '{tool_name}' failed with error: {err}",
-                    }
-                )
-                working_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Tool execution failed. Continue without that tool and "
-                            "answer naturally."
-                        ),
-                    }
-                )
-                continue
-
-            result_text = self._format_tool_result(tool_result)
-            working_messages.append({"role": "assistant", "content": f"Tool '{tool_name}' executed."})
-            working_messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"Tool result ({tool_name}): {result_text}\n"
-                        f"Original user request: {original_user_request or 'Use the user request in context.'}\n"
-                        "Now answer the original user request directly in natural language.\n"
-                        "If the user asked 'why', include clear causal reasoning grounded in the tool result.\n"
-                        "If any metric is unavailable, state that it is unavailable.\n"
-                        "If the user contradicts sensor output, acknowledge sensors may be stale or failing.\n"
-                        "Do not argue with the user and do not invent theories to defend sensor output.\n"
-                        "Never gaslight the user.\n"
-                        "Do not guess missing values or blame the current mode.\n"
-                        "Do not output JSON, markdown code fences, or raw object dumps."
-                    ),
-                }
-            )
+                try:
+                    tool_result = await tool_registry.execute(tool_name, tool_args)
+                    result_text = self._format_tool_result(tool_result)
+                    working_messages.append({"role": "tool", "name": tool_name, "content": result_text})
+                except Exception as err:
+                    working_messages.append({"role": "tool", "name": tool_name, "content": f"Error: {err}"})
 
         return "I could not complete the request safely within the local tool-call limit."
 
@@ -491,17 +380,7 @@ class Orchestrator:
                 line for line in cleaned.splitlines() if not line.strip().startswith("```")
             ).strip()
 
-        if cls._extract_tool_call(cleaned) is not None:
-            return "Working on that now."
-
-        visible_lines: list[str] = []
-        for line in cleaned.splitlines():
-            if cls._extract_tool_call(line.strip()) is not None:
-                continue
-            visible_lines.append(line)
-
-        visible_text = "\n".join(visible_lines).strip()
-        return visible_text or "Done."
+        return cleaned or "Done."
 
     @staticmethod
     def _strip_thinking_tags(text: str) -> str:
@@ -538,73 +417,6 @@ class Orchestrator:
             await on_stream_delta(chunk)
             await asyncio.sleep(0)
 
-    @staticmethod
-    def _needs_system_status_tool(user_text: str) -> bool:
-        normalized = user_text.lower()
-        keywords = (
-            "battery",
-            "cpu",
-            "ram",
-            "memory",
-            "pagefile",
-            "swap",
-            "system status",
-            "check the sys",
-            "สถานะเครื่อง",
-            "แบต",
-            "แรม",
-            "ซีพียู",
-        )
-        return any(keyword in normalized for keyword in keywords)
-
-    async def _build_streaming_messages(
-        self,
-        *,
-        messages: list[dict[str, str]],
-        user_text: str,
-        active_mode: str,
-    ) -> tuple[list[dict[str, str]], str | None]:
-        """Build a fast streaming prompt path.
-
-        For system-health queries we execute get_system_status first, then stream a
-        grounded synthesis answer. For all other queries we stream directly.
-        """
-        if not self._needs_system_status_tool(user_text):
-            return messages, None
-
-        decision = await self._assess_tool_call(tool_name="get_system_status", active_mode=active_mode)
-        if not decision.allowed:
-            return [], self._guardian_message(decision)
-
-        try:
-            tool_result = await tool_registry.execute("get_system_status", {})
-        except (KeyError, ValueError, RuntimeError) as err:
-            return [], (
-                "I could not run the local system-status tool right now. "
-                f"Error: {err}"
-            )
-
-        result_text = self._format_tool_result(tool_result)
-        grounded_messages = [dict(message) for message in messages]
-        grounded_messages.append({"role": "assistant", "content": "Tool 'get_system_status' executed."})
-        grounded_messages.append(
-            {
-                "role": "user",
-                "content": (
-                    f"Tool result (get_system_status): {result_text}\n"
-                    f"Original user request: {user_text.strip()}\n"
-                    "Answer directly and naturally.\n"
-                    "If the user asked why, provide causal reasoning grounded only in this tool result.\n"
-                    "If a value is unavailable, say it is unavailable.\n"
-                    "If the user contradicts sensor output, acknowledge sensors may be stale or failing.\n"
-                    "Do not argue with the user and do not invent theories to defend sensor output.\n"
-                    "Never gaslight the user.\n"
-                    "Do not output JSON or raw object dumps."
-                ),
-            }
-        )
-        return grounded_messages, None
-
     # ------------------------------------------------------------------
     # WebSocket streaming text inference
     # ------------------------------------------------------------------
@@ -632,27 +444,46 @@ class Orchestrator:
                 await self._invoke_host_optimizer(model_name=model_name, mode=profile.mode)
                 await on_stream_start(model_name)
 
-                session_messages = [
-                    dict(message) for message in (self._memory.get_messages(session_id) or [])
-                ]
-                streaming_messages, immediate_text = await self._build_streaming_messages(
-                    messages=session_messages,
-                    user_text=user_text,
-                    active_mode=profile.mode,
-                )
+                session_messages = [dict(message) for message in (self._memory.get_messages(session_id) or [])]
+                ollama_tools = self._get_ollama_tools()
 
-                if immediate_text is not None:
-                    visible_text = self._sanitize_visible_text(immediate_text)
-                    await self._emit_stream_deltas(visible_text, on_stream_delta)
-                else:
-                    visible_text = await self._ollama.generate_streaming(
-                        streaming_messages,
+                for _ in range(_MAX_TOOL_CALL_ROUNDS + 1):
+                    visible_text, tool_calls = await self._ollama.generate_streaming(
+                        session_messages,
                         model_name,
                         profile,
                         on_stream_delta,
                         num_gpu=self._resolve_num_gpu(profile.mode),
+                        tools=ollama_tools,
                     )
-                    visible_text = self._sanitize_visible_text(visible_text)
+
+                    if not tool_calls:
+                        visible_text = self._sanitize_visible_text(visible_text).strip()
+                        break
+
+                    session_messages.append({"role": "assistant", "content": visible_text, "tool_calls": tool_calls})
+                    for tool_call in tool_calls:
+                        func_data = tool_call.get("function", {})
+                        tool_name = func_data.get("name")
+                        tool_args = func_data.get("arguments", {})
+
+                        if not tool_registry.has_tool(tool_name):
+                            session_messages.append({"role": "tool", "name": tool_name, "content": "Tool unavailable."})
+                            continue
+
+                        decision = await self._assess_tool_call(tool_name=tool_name, active_mode=profile.mode)
+                        if not decision.allowed:
+                            session_messages.append({"role": "tool", "name": tool_name, "content": f"Blocked: {decision.reason}"})
+                            continue
+
+                        try:
+                            tool_result = await tool_registry.execute(tool_name, tool_args)
+                            result_text = self._format_tool_result(tool_result)
+                            session_messages.append({"role": "tool", "name": tool_name, "content": result_text})
+                        except Exception as err:
+                            session_messages.append({"role": "tool", "name": tool_name, "content": f"Error: {err}"})
+                else:
+                    visible_text = "I could not complete the request safely within the local tool-call limit."
 
                 await on_stream_end(visible_text)
                 self._memory.append_assistant(session_id, visible_text)
@@ -716,29 +547,47 @@ class Orchestrator:
                 await self._enforce_pressure_guardrail(model_name)
                 await self._invoke_host_optimizer(model_name=model_name, mode=profile.mode)
 
-                session_messages = [
-                    dict(message) for message in (self._memory.get_messages(session_id) or [])
-                ]
-                streaming_messages, immediate_text = await self._build_streaming_messages(
-                    messages=session_messages,
-                    user_text=user_text,
-                    active_mode=effective_profile.mode,
-                )
+                session_messages = [dict(message) for message in (self._memory.get_messages(session_id) or [])]
+                ollama_tools = self._get_ollama_tools()
 
-                if immediate_text is not None:
-                    final_text = self._sanitize_visible_text(immediate_text).strip()
-                    for chunk in self._chunk_text_for_streaming(final_text):
-                        await streamer.on_delta(chunk)
-                else:
-                    final_text = await self._ollama.generate_streaming(
-                        streaming_messages,
+                for _ in range(_MAX_TOOL_CALL_ROUNDS + 1):
+                    final_text, tool_calls = await self._ollama.generate_streaming(
+                        session_messages,
                         model_name,
                         effective_profile,
                         streamer.on_delta,
                         num_gpu=self._resolve_num_gpu(effective_profile.mode),
                         num_ctx_override=effective_num_ctx,
+                        tools=ollama_tools,
                     )
-                    final_text = self._sanitize_visible_text(final_text).strip()
+
+                    if not tool_calls:
+                        final_text = self._sanitize_visible_text(final_text).strip()
+                        break
+
+                    session_messages.append({"role": "assistant", "content": final_text, "tool_calls": tool_calls})
+                    for tool_call in tool_calls:
+                        func_data = tool_call.get("function", {})
+                        tool_name = func_data.get("name")
+                        tool_args = func_data.get("arguments", {})
+
+                        if not tool_registry.has_tool(tool_name):
+                            session_messages.append({"role": "tool", "name": tool_name, "content": "Tool unavailable."})
+                            continue
+
+                        decision = await self._assess_tool_call(tool_name=tool_name, active_mode=effective_profile.mode)
+                        if not decision.allowed:
+                            session_messages.append({"role": "tool", "name": tool_name, "content": f"Blocked: {decision.reason}"})
+                            continue
+
+                        try:
+                            tool_result = await tool_registry.execute(tool_name, tool_args)
+                            result_text = self._format_tool_result(tool_result)
+                            session_messages.append({"role": "tool", "name": tool_name, "content": result_text})
+                        except Exception as err:
+                            session_messages.append({"role": "tool", "name": tool_name, "content": f"Error: {err}"})
+                else:
+                    final_text = "I could not complete the request safely within the local tool-call limit."
 
                 # Flush trailing text and dispatch trailing TTS sentence
                 trailing = streamer.get_trailing_sentence_buffer()
