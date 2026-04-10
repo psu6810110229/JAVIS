@@ -4,9 +4,11 @@ import asyncio
 import base64
 import binascii
 import io
+import json
 import logging
+import re
 from datetime import datetime
-from typing import Any
+from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -15,18 +17,23 @@ from pydantic import BaseModel, Field, ValidationError
 from pydub import AudioSegment
 from pydub.exceptions import CouldntDecodeError
 
-from .config import load_project_env
+from .config import SystemConfig, load_project_env
 from .tts_engine import KokoroTtsEngine, TtsEngineError
 
 logger = logging.getLogger(__name__)
-DEFAULT_OLLAMA_MODEL_NAME = "scb10x/llama3.1-typhoon2-8b-instruct"
-DEFAULT_FALLBACK_OLLAMA_MODEL_NAME = "llama3:8b"
+DEFAULT_OLLAMA_MODEL_NAME = "typhoon-v2.5-4b-instruct"
+DEFAULT_FALLBACK_OLLAMA_MODEL_NAME = "typhoon-v2.5-4b-instruct"
 DEFAULT_OLLAMA_BASE_URL = "http://ollama:11434"
 DEFAULT_OLLAMA_TIMEOUT_SECONDS = 60.0
 DEFAULT_OLLAMA_PULL_TIMEOUT_SECONDS = 1800.0
 DEFAULT_OLLAMA_TEMPERATURE = 0.7
 DEFAULT_OLLAMA_NUM_CTX = 2048
 FALLBACK_OLLAMA_NUM_CTX = 1024
+DEFAULT_PREWARM_NUM_CTX = 64
+DEFAULT_OLLAMA_KEEP_ALIVE = -1
+DEFAULT_OLLAMA_NUM_THREAD = 4
+DEFAULT_HTTP_CHAT_NUM_THREAD = 4
+DEFAULT_SENTENCE_TTS_CONCURRENCY = 2
 DEFAULT_STT_LANGUAGE = "th-TH"
 
 
@@ -80,7 +87,11 @@ class VoiceInteractionResult(BaseModel):
 class JarvisBrain:
     def __init__(self, model_name: str | None = None) -> None:
         load_project_env()
-        self._preferred_model_name = model_name or DEFAULT_OLLAMA_MODEL_NAME
+        self._system_config = SystemConfig()
+        if model_name is not None:
+            self._preferred_model_name = model_name
+        else:
+            self._preferred_model_name = self._system_config.get_active_model()
         self._fallback_model_name = DEFAULT_FALLBACK_OLLAMA_MODEL_NAME
         self._model_name = self._preferred_model_name
         self._ollama_base_url = DEFAULT_OLLAMA_BASE_URL
@@ -90,25 +101,26 @@ class JarvisBrain:
         self._tts_voice = self._tts_engine.voice_label
         self._stt_language = DEFAULT_STT_LANGUAGE
         self._system_instruction = (
-            "You are Jarvis: sophisticated, intelligent, and subtly witty. "
-            "You are a trusted partner to Me, not a robotic script. "
-            "Always address the user as Sir or You. "
-            "Dynamic value rule: match response depth to user intent. "
-            "For small talk like hey or morning, keep replies under 10 words. "
-            "For direct commands like be quiet or shut up, confirm politely and then stop, for example: Certainly, Sir. Standing by. "
-            "For technical or knowledge questions, give a clear 2-3 sentence overview, then wait. "
-            "If the user asks for details or follow-up, expand naturally. "
-            "Use modern professional English with occasional dry British wit. "
-            "Avoid lectures, avoid unnecessary fluff, and do not correct grammar, slang, or typos. "
-            "Prefer efficiency with class."
+            "You are Jarvis. Stay polite, concise, and use a British professional tone. "
+            "Acknowledge the current mode (Eco/Performance) only if asked. "
+            "For small talk, keep replies brief. For technical requests, respond clearly and directly. "
+            "Avoid unnecessary verbosity and keep output practical. "
+            "Always answer in English unless the user specifically requests Thai. "
         )
         self._sessions: dict[str, list[dict[str, str]] | None] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._initialization_lock = asyncio.Lock()
+        self._model_switch_lock = asyncio.Lock()
         self._initialized = False
         self._ollama_available = False
         self._initialization_error: str | None = None
         self._tool_schemas = self._build_tool_schemas()
+        self._sentence_tts_semaphore = asyncio.Semaphore(DEFAULT_SENTENCE_TTS_CONCURRENCY)
+
+    def _active_model_name(self) -> str:
+        current_model = self._system_config.get_active_model()
+        self._model_name = current_model
+        return current_model
 
     @property
     def tool_schemas(self) -> list[ToolSchema]:
@@ -144,6 +156,7 @@ class JarvisBrain:
                 )
 
     async def _ensure_model_ready(self) -> tuple[bool, str | None]:
+        self._model_name = self._active_model_name()
         healthy, payload_or_error = await self._fetch_ollama_tags()
         if not healthy:
             return False, payload_or_error
@@ -286,8 +299,9 @@ class JarvisBrain:
         session_lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         async with session_lock:
             messages.append({"role": "user", "content": user_text})
+            model_name = self._active_model_name()
             try:
-                response_text = await self._generate_ollama_response(messages)
+                response_text = await self._generate_ollama_response(messages, model_name)
                 messages.append({"role": "assistant", "content": response_text})
                 self._ollama_available = True
                 self._initialization_error = None
@@ -305,8 +319,8 @@ class JarvisBrain:
                 messages.pop()
                 return BrainResponse(
                     text=(
-                        f"Jarvis local model '{self._model_name}' is not ready. "
-                        f"Run 'ollama pull {self._model_name}' and retry. "
+                        f"Jarvis local model '{model_name}' is not ready. "
+                        f"Run 'ollama pull {model_name}' and retry. "
                         f"Details: {error}"
                     ),
                     tool_schemas=self.tool_schemas,
@@ -343,7 +357,8 @@ class JarvisBrain:
             audio_error=audio_error,
         )
 
-    async def _check_ollama_health(self) -> tuple[bool, str | None]:
+    async def _check_ollama_health(self, model_name: str | None = None) -> tuple[bool, str | None]:
+        model_name = model_name or self._active_model_name()
         try:
             timeout = httpx.Timeout(self._ollama_timeout)
             async with httpx.AsyncClient(base_url=self._ollama_base_url, timeout=timeout) as client:
@@ -368,25 +383,27 @@ class JarvisBrain:
         model_name_matches = any(
             isinstance(model, dict)
             and isinstance(model.get("name"), str)
-            and model.get("name", "").split(":", 1)[0] == self._model_name
+            and model.get("name", "").split(":", 1)[0] == model_name
             for model in models
         )
         if not model_name_matches and models:
             logger.warning(
                 "Configured model '%s' not currently listed in Ollama tags. It may need to be pulled.",
-                self._model_name,
+                model_name,
             )
 
         return True, None
 
-    async def _generate_ollama_response(self, messages: list[dict[str, str]]) -> str:
+    async def _generate_ollama_response(self, messages: list[dict[str, str]], model_name: str) -> str:
         request_payload = {
-            "model": self._model_name,
+            "model": model_name,
             "messages": messages,
             "stream": False,
+            "keep_alive": DEFAULT_OLLAMA_KEEP_ALIVE,
             "options": {
                 "temperature": DEFAULT_OLLAMA_TEMPERATURE,
                 "num_ctx": DEFAULT_OLLAMA_NUM_CTX,
+                "num_thread": DEFAULT_OLLAMA_NUM_THREAD,
             },
         }
 
@@ -409,6 +426,7 @@ class JarvisBrain:
                     "options": {
                         "temperature": DEFAULT_OLLAMA_TEMPERATURE,
                         "num_ctx": FALLBACK_OLLAMA_NUM_CTX,
+                        "num_thread": DEFAULT_OLLAMA_NUM_THREAD,
                     },
                 }
                 try:
@@ -456,6 +474,382 @@ class JarvisBrain:
             raise OllamaResponseError("assistant message content is empty")
 
         return cleaned_content
+
+    async def _generate_ollama_response_streaming(
+        self,
+        messages: list[dict[str, str]],
+        model_name: str,
+        on_delta: Callable[[str], Awaitable[None]],
+        *,
+        num_thread: int = DEFAULT_OLLAMA_NUM_THREAD,
+    ) -> str:
+        request_payload = {
+            "model": model_name,
+            "messages": messages,
+            "stream": True,
+            "keep_alive": DEFAULT_OLLAMA_KEEP_ALIVE,
+            "options": {
+                "temperature": DEFAULT_OLLAMA_TEMPERATURE,
+                "num_ctx": DEFAULT_OLLAMA_NUM_CTX,
+                "num_thread": num_thread,
+            },
+        }
+
+        try:
+            timeout = httpx.Timeout(self._ollama_timeout)
+            async with httpx.AsyncClient(base_url=self._ollama_base_url, timeout=timeout) as client:
+                async with client.stream("POST", "/api/chat", json=request_payload) as response:
+                    if response.status_code >= 400:
+                        detail = (await response.aread()).decode("utf-8", errors="ignore").strip()
+                        detail = detail or f"HTTP {response.status_code}"
+                        if response.status_code in (400, 404):
+                            lower_detail = detail.lower()
+                            if "model" in lower_detail and ("not found" in lower_detail or "missing" in lower_detail):
+                                raise OllamaModelError(detail)
+                        raise OllamaUnavailableError(detail)
+
+                    accumulated = ""
+                    async for line in response.aiter_lines():
+                        if not line or not line.strip():
+                            continue
+
+                        try:
+                            payload = json.loads(line)
+                        except ValueError as error:
+                            raise OllamaResponseError(f"invalid streaming JSON payload ({error})") from error
+
+                        payload_error = payload.get("error")
+                        if isinstance(payload_error, str) and payload_error.strip():
+                            lower_error = payload_error.lower()
+                            if "model" in lower_error and ("not found" in lower_error or "missing" in lower_error):
+                                raise OllamaModelError(payload_error)
+                            raise OllamaUnavailableError(payload_error)
+
+                        message_payload = payload.get("message")
+                        if isinstance(message_payload, dict):
+                            chunk = message_payload.get("content")
+                            if isinstance(chunk, str) and chunk:
+                                accumulated += chunk
+                                await on_delta(chunk)
+
+                    if not accumulated.strip():
+                        raise OllamaResponseError("assistant message content is empty")
+
+                    return accumulated.strip()
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as error:
+            raise OllamaUnavailableError(str(error)) from error
+        except httpx.HTTPError as error:
+            raise OllamaUnavailableError(str(error)) from error
+
+    async def _prewarm_model(self, model_name: str) -> None:
+        prewarm_payload = {
+            "model": model_name,
+            "messages": [],
+            "stream": False,
+            "keep_alive": DEFAULT_OLLAMA_KEEP_ALIVE,
+            "options": {
+                "temperature": 0,
+                "num_ctx": DEFAULT_PREWARM_NUM_CTX,
+                "num_thread": DEFAULT_OLLAMA_NUM_THREAD,
+            },
+        }
+        try:
+            timeout = httpx.Timeout(self._ollama_timeout)
+            async with httpx.AsyncClient(base_url=self._ollama_base_url, timeout=timeout) as client:
+                response = await client.post("/api/chat", json=prewarm_payload)
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as error:
+            raise OllamaUnavailableError(str(error)) from error
+        except httpx.HTTPError as error:
+            raise OllamaUnavailableError(str(error)) from error
+
+        if response.status_code >= 400:
+            detail = response.text.strip() or f"HTTP {response.status_code}"
+            lower_detail = detail.lower()
+            if response.status_code in (400, 404) and "model" in lower_detail and (
+                "not found" in lower_detail or "missing" in lower_detail
+            ):
+                raise OllamaModelError(detail)
+            raise OllamaUnavailableError(detail)
+
+    async def set_active_mode(self, mode: str, prewarm: bool = False) -> dict[str, Any]:
+        async with self._model_switch_lock:
+            target_model = self._system_config.resolve_model(mode)
+
+            healthy, payload_or_error = await self._fetch_ollama_tags()
+            if not healthy:
+                raise OllamaUnavailableError(str(payload_or_error))
+
+            assert isinstance(payload_or_error, dict)
+            available_models = self._extract_model_names(payload_or_error)
+            if target_model not in available_models:
+                if mode == "performance":
+                    raise OllamaModelError("Performance model not found. Run 'ollama pull' first.")
+                raise OllamaModelError(f"Model '{target_model}' not found. Run 'ollama pull {target_model}' first.")
+
+            self._system_config.set_mode(mode)
+            self._model_name = target_model
+            self._ollama_available = True
+            self._initialization_error = None
+
+            prewarm_warning: str | None = None
+            if prewarm:
+                try:
+                    await self._prewarm_model(target_model)
+                except (OllamaUnavailableError, OllamaModelError) as error:
+                    prewarm_warning = str(error)
+
+            return {
+                "active_mode": mode,
+                "active_model": target_model,
+                "message": f"Switched to {mode} mode.",
+                "prewarm_attempted": prewarm,
+                "prewarm_warning": prewarm_warning,
+            }
+
+    async def prewarm_model_non_blocking(self, model_name: str) -> None:
+        try:
+            await self._prewarm_model(model_name)
+        except (OllamaUnavailableError, OllamaModelError, OllamaResponseError) as error:
+            logger.warning("Model prewarm failed for '%s': %s", model_name, error)
+
+    async def handle_text_streaming(
+        self,
+        session_id: str,
+        user_text: str,
+        on_stream_start: Callable[[str], Awaitable[None]],
+        on_stream_delta: Callable[[str], Awaitable[None]],
+        on_stream_end: Callable[[str], Awaitable[None]],
+    ) -> BrainResponse:
+        if not user_text.strip():
+            return BrainResponse(
+                text="I did not receive any text to process.",
+                tool_schemas=self.tool_schemas,
+            )
+
+        await self.create_session(session_id)
+        messages = self._sessions.get(session_id)
+        if messages is None:
+            return BrainResponse(
+                text="Jarvis session state is unavailable. Please restart the session.",
+                tool_schemas=self.tool_schemas,
+            )
+
+        session_lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        async with session_lock:
+            messages.append({"role": "user", "content": user_text})
+            model_name = self._active_model_name()
+
+            try:
+                await on_stream_start(model_name)
+                response_text = await self._generate_ollama_response_streaming(
+                    messages=messages,
+                    model_name=model_name,
+                    on_delta=on_stream_delta,
+                    num_thread=DEFAULT_OLLAMA_NUM_THREAD,
+                )
+                await on_stream_end(response_text)
+                messages.append({"role": "assistant", "content": response_text})
+                self._ollama_available = True
+                self._initialization_error = None
+            except OllamaUnavailableError as error:
+                logger.exception("Ollama unavailable for session '%s'.", session_id)
+                self._ollama_available = False
+                self._initialization_error = str(error)
+                messages.pop()
+                return BrainResponse(
+                    text=f"Jarvis could not reach local Ollama at {self._ollama_base_url}: {error}",
+                    tool_schemas=self.tool_schemas,
+                )
+            except OllamaModelError as error:
+                logger.exception("Ollama model error for session '%s'.", session_id)
+                messages.pop()
+                return BrainResponse(
+                    text=(
+                        f"Jarvis local model '{model_name}' is not ready. "
+                        f"Run 'ollama pull {model_name}' and retry. "
+                        f"Details: {error}"
+                    ),
+                    tool_schemas=self.tool_schemas,
+                )
+            except OllamaResponseError as error:
+                logger.exception("Ollama response parse failed for session '%s'.", session_id)
+                messages.pop()
+                return BrainResponse(
+                    text=f"Jarvis received an invalid response from Ollama: {error}",
+                    tool_schemas=self.tool_schemas,
+                )
+            except RuntimeError as error:
+                logger.exception("Chat session failed for session '%s'.", session_id)
+                messages.pop()
+                return BrainResponse(
+                    text=f"Jarvis encountered a runtime error while processing your message: {error}",
+                    tool_schemas=self.tool_schemas,
+                )
+
+        response_text = response_text or "Jarvis completed the request without a text response."
+
+        assistant_audio: AssistantAudioPayload | None = None
+        audio_error: str | None = None
+        try:
+            assistant_audio = await self._synthesize_assistant_audio(response_text)
+        except AudioProcessingError as error:
+            logger.exception("Thai TTS generation failed for session '%s': %s", session_id, error)
+            audio_error = str(error)
+
+        return BrainResponse(
+            text=response_text,
+            tool_schemas=self.tool_schemas,
+            assistant_audio=assistant_audio,
+            audio_error=audio_error,
+        )
+
+    async def synthesize_manual_text(self, text: str) -> AssistantAudioPayload:
+        return await self._synthesize_assistant_audio(text)
+
+    @staticmethod
+    def _extract_sentence_chunks(buffer: str) -> tuple[list[str], str]:
+        chunks: list[str] = []
+        boundary_pattern = re.compile(r"[.!?\n]")
+        cursor = 0
+
+        while True:
+            match = boundary_pattern.search(buffer, cursor)
+            if match is None:
+                break
+
+            boundary_index = match.end()
+            chunk = buffer[:boundary_index].strip()
+            if chunk:
+                chunks.append(chunk)
+            buffer = buffer[boundary_index:]
+            cursor = 0
+
+        return chunks, buffer
+
+    async def _synthesize_sentence_chunk(
+        self,
+        sentence_index: int,
+        sentence_text: str,
+        on_sentence_audio: Callable[[int, str, AssistantAudioPayload | None, str | None], Awaitable[None]],
+    ) -> None:
+        try:
+            async with self._sentence_tts_semaphore:
+                audio_payload = await self._synthesize_assistant_audio(sentence_text)
+            await on_sentence_audio(sentence_index, sentence_text, audio_payload, None)
+        except AudioProcessingError as error:
+            await on_sentence_audio(sentence_index, sentence_text, None, str(error))
+
+    async def handle_http_chat_streaming(
+        self,
+        session_id: str,
+        user_text: str,
+        auto_speak: bool,
+        on_text_chunk: Callable[[str], Awaitable[None]],
+        on_sentence_audio: Callable[[int, str, AssistantAudioPayload | None, str | None], Awaitable[None]],
+    ) -> str:
+        if not user_text.strip():
+            raise RuntimeError("I did not receive any text to process.")
+
+        await self.create_session(session_id)
+        messages = self._sessions.get(session_id)
+        if messages is None:
+            raise RuntimeError("Jarvis session state is unavailable. Please restart the session.")
+
+        session_lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        sentence_buffer = ""
+        sentence_index = 0
+        sentence_tasks: list[asyncio.Task[None]] = []
+
+        async def on_delta(delta: str) -> None:
+            nonlocal sentence_buffer, sentence_index
+            if not delta:
+                return
+
+            await on_text_chunk(delta)
+
+            if not auto_speak:
+                return
+
+            sentence_buffer += delta
+            completed_chunks, sentence_buffer = self._extract_sentence_chunks(sentence_buffer)
+            for chunk in completed_chunks:
+                current_index = sentence_index
+                sentence_index += 1
+                sentence_tasks.append(
+                    asyncio.create_task(
+                        self._synthesize_sentence_chunk(
+                            sentence_index=current_index,
+                            sentence_text=chunk,
+                            on_sentence_audio=on_sentence_audio,
+                        )
+                    )
+                )
+
+        async with session_lock:
+            messages.append({"role": "user", "content": user_text})
+            model_name = self._active_model_name()
+
+            try:
+                final_text = await self._generate_ollama_response_streaming(
+                    messages=messages,
+                    model_name=model_name,
+                    on_delta=on_delta,
+                    num_thread=DEFAULT_HTTP_CHAT_NUM_THREAD,
+                )
+
+                if auto_speak:
+                    trailing_chunk = sentence_buffer.strip()
+                    if trailing_chunk:
+                        current_index = sentence_index
+                        sentence_index += 1
+                        sentence_tasks.append(
+                            asyncio.create_task(
+                                self._synthesize_sentence_chunk(
+                                    sentence_index=current_index,
+                                    sentence_text=trailing_chunk,
+                                    on_sentence_audio=on_sentence_audio,
+                                )
+                            )
+                        )
+
+                if sentence_tasks:
+                    await asyncio.gather(*sentence_tasks, return_exceptions=False)
+
+                final_text = final_text.strip()
+                messages.append({"role": "assistant", "content": final_text})
+                self._ollama_available = True
+                self._initialization_error = None
+                return final_text
+            except (OllamaUnavailableError, OllamaModelError, OllamaResponseError, RuntimeError):
+                for task in sentence_tasks:
+                    if not task.done():
+                        task.cancel()
+                if sentence_tasks:
+                    await asyncio.gather(*sentence_tasks, return_exceptions=True)
+                messages.pop()
+                raise
+
+    async def get_system_status(self) -> dict[str, Any]:
+        active_mode = self._system_config.get_mode()
+        active_model = self._active_model_name()
+        models = self._system_config.get_models()
+        healthy, health_error = await self._check_ollama_health(active_model)
+
+        self._ollama_available = healthy
+        self._initialization_error = None if healthy else health_error
+
+        return {
+            "service": "jarvis-backend",
+            "active_mode": active_mode,
+            "active_model": active_model,
+            "models": models,
+            "ollama_base_url": self._ollama_base_url,
+            "system_load": {
+                "ollama_ready": healthy,
+            },
+            "status": "ready" if healthy else "degraded",
+            "error": health_error,
+        }
 
     async def handle_audio_chunk(
         self,
@@ -582,9 +976,12 @@ class JarvisBrain:
         }
 
     def _get_backend_status(self) -> dict[str, str]:
+        active_mode = self._system_config.get_mode()
+        active_model = self._active_model_name()
         return {
             "service": "jarvis-backend",
-            "model_name": self._model_name,
+            "mode": active_mode,
+            "model_name": active_model,
             "ollama_base_url": self._ollama_base_url,
             "ollama_configured": str(self._ollama_available).lower(),
             "tts_voice": self._tts_voice,

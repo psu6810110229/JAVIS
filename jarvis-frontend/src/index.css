@@ -1,23 +1,131 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap");
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  color: #e8f0ff;
+  color: #e0e0e0;
   background:
-    radial-gradient(circle at top, rgba(82, 167, 255, 0.18), transparent 28%),
-    radial-gradient(circle at bottom right, rgba(62, 224, 180, 0.14), transparent 22%),
-    linear-gradient(160deg, #030712 0%, #071221 52%, #04111b 100%);
-  font-family: "Segoe UI Variable Display", "Aptos", "Trebuchet MS", sans-serif;
+    linear-gradient(180deg, rgba(30, 30, 30, 0.25) 0%, rgba(10, 10, 10, 0.95) 56%),
+    #0a0a0a;
+  font-family: "Inter", "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
 }
 
 body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background: transparent;
+  background: #0a0a0a;
 }
 
 #root {
   min-height: 100vh;
+}
+
+.minimal-root {
+  background: linear-gradient(180deg, #121212 0%, #0a0a0a 100%);
+}
+
+.breathing-soft {
+  animation: breathing-soft 1.8s ease-in-out infinite;
+}
+
+.top-progress-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, rgba(166, 124, 72, 0.45) 0%, rgba(216, 166, 99, 0.9) 55%, rgba(166, 124, 72, 0.45) 100%);
+  animation: progress-breathe 1.6s ease-in-out infinite;
+  z-index: 60;
+}
+
+.thinking-shell {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 2px;
+  border: 1px solid #222;
+  border-radius: 999px;
+  padding: 6px 11px;
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0.015) 0%, rgba(255, 255, 255, 0.03) 52%, rgba(255, 255, 255, 0.015) 100%);
+}
+
+.thinking-label {
+  margin: 0;
+  font-size: 12px;
+  color: #8a8a8a;
+  letter-spacing: 0.01em;
+}
+
+.thinking-wave {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.thinking-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: #8d8d8d;
+  animation: thinking-wave 1.1s ease-in-out infinite;
+}
+
+.thinking-dot:nth-child(2) {
+  animation-delay: 0.16s;
+}
+
+.thinking-dot:nth-child(3) {
+  animation-delay: 0.32s;
+}
+
+.listening-pulse {
+  animation: listening-pulse 0.95s ease-in-out infinite;
+}
+
+@keyframes breathing-soft {
+  0%,
+  100% {
+    opacity: 0.72;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes progress-breathe {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes thinking-wave {
+  0%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.35;
+  }
+  50% {
+    transform: translateY(-2px);
+    opacity: 1;
+  }
+}
+
+@keyframes listening-pulse {
+  0%,
+  100% {
+    transform: scale(0.92);
+    opacity: 0.45;
+  }
+  50% {
+    transform: scale(1.08);
+    opacity: 1;
+  }
 }

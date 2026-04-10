@@ -12,7 +12,6 @@ KOKORO_MODEL = "kokoro"
 KOKORO_VOICE = "bm_george"
 KOKORO_OUTPUT_PATH = Path("/tmp/jarvis_assistant_audio.mp3")
 KOKORO_TIMEOUT_SECONDS = 60
-KOKORO_LEADING_PAUSE = ", ... "
 
 
 class TtsEngineError(Exception):
@@ -39,8 +38,7 @@ class KokoroTtsEngine:
             raise TtsEngineError("Cannot synthesize empty text.")
 
         try:
-            prepared_text = self._with_leading_pause(text)
-            audio_bytes = await asyncio.to_thread(self._synthesize_sync, prepared_text)
+            audio_bytes = await asyncio.to_thread(self._synthesize_sync, text)
         except Exception as error:  # noqa: BLE001
             raise TtsEngineError("Jarvis could not generate Kokoro speech output.") from error
 
@@ -68,7 +66,3 @@ class KokoroTtsEngine:
         KOKORO_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
         KOKORO_OUTPUT_PATH.write_bytes(response.content)
         return KOKORO_OUTPUT_PATH.read_bytes()
-
-    @staticmethod
-    def _with_leading_pause(text: str) -> str:
-        return f"{KOKORO_LEADING_PAUSE}{text}"

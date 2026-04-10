@@ -1,7 +1,9 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
+import PowerController from "./PowerController";
 
 type SocketStatus = "disconnected" | "connecting" | "connected";
+type PowerMode = "eco" | "performance";
 
 type Envelope = {
   type: string;
@@ -24,6 +26,24 @@ type AssistantAudioPayload = {
 };
 
 const DEFAULT_WS_URL = "ws://127.0.0.1:8000/ws";
+const DEFAULT_API_URL = "http://127.0.0.1:8000";
+const POWER_MODE_STORAGE_KEY = "jarvis.power.mode";
+const VOICE_AUTO_SPEAK_STORAGE_KEY = "jarvis.voice.auto_speak";
+const PTT_HOTKEY = "Alt";
+
+function readPersistedPowerMode(): PowerMode {
+  const persisted = window.localStorage.getItem(POWER_MODE_STORAGE_KEY);
+  return persisted === "performance" ? "performance" : "eco";
+}
+
+function readPersistedVoiceAutoSpeak(): boolean {
+  const persisted = window.localStorage.getItem(VOICE_AUTO_SPEAK_STORAGE_KEY);
+  if (persisted === null) {
+    return true;
+  }
+
+  return persisted !== "off";
+}
 
 function base64ToBlob(base64: string, mimeType: string): Blob {
   const binaryString = window.atob(base64);
@@ -78,7 +98,26 @@ function App() {
   const [micError, setMicError] = useState<string>("");
   const [audioUiError, setAudioUiError] = useState<string>("");
   const [sttUiError, setSttUiError] = useState<string>("");
+  const [voiceAutoSpeak, setVoiceAutoSpeak] = useState<boolean>(() => readPersistedVoiceAutoSpeak());
+  const [currentMode, setCurrentMode] = useState<PowerMode>(() => readPersistedPowerMode());
+  const [activeModel, setActiveModel] = useState<string>("");
+  const [isSwitchingMode, setIsSwitchingMode] = useState<boolean>(false);
+  const [statusLoadError, setStatusLoadError] = useState<string>("");
+  const [prewarmWarning, setPrewarmWarning] = useState<string>("");
+  const [pendingAssistantResponse, setPendingAssistantResponse] = useState<boolean>(false);
+  const [awaitingAssistantAudio, setAwaitingAssistantAudio] = useState<boolean>(false);
+  const [isTextStreaming, setIsTextStreaming] = useState<boolean>(false);
+  const [showVoiceControls, setShowVoiceControls] = useState<boolean>(false);
+  const [showModelContext, setShowModelContext] = useState<boolean>(false);
+  const [transportNotice, setTransportNotice] = useState<string>("");
+  const [manualListenMessageId, setManualListenMessageId] = useState<string>("");
   const socketRef = useRef<WebSocket | null>(null);
+  const chatAbortControllerRef = useRef<AbortController | null>(null);
+  const activeHttpAssistantMessageIdRef = useRef<string | null>(null);
+  const messagesViewportRef = useRef<HTMLDivElement | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const manualDisconnectRef = useRef<boolean>(false);
+  const pttHeldRef = useRef<boolean>(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<BlobPart[]>([]);
@@ -91,26 +130,257 @@ function App() {
   const audioErrorTimeoutRef = useRef<number | null>(null);
   const audioUiHideTimeoutRef = useRef<number | null>(null);
   const sttUiHideTimeoutRef = useRef<number | null>(null);
+  const modelContextTimeoutRef = useRef<number | null>(null);
+  const activeStreamIdRef = useRef<string | null>(null);
+  const activeStreamMessageIdRef = useRef<string | null>(null);
+  const autoSpeakQueueRef = useRef<AssistantAudioPayload[]>([]);
+  const autoSpeakPlayingRef = useRef<boolean>(false);
   const wsUrl = import.meta.env.VITE_JARVIS_WS_URL ?? DEFAULT_WS_URL;
+  const apiBaseUrl = import.meta.env.VITE_JARVIS_API_URL ?? DEFAULT_API_URL;
   const mediaRecorderSupported =
     typeof window !== "undefined" &&
     typeof navigator !== "undefined" &&
     typeof navigator.mediaDevices !== "undefined" &&
     typeof navigator.mediaDevices.getUserMedia === "function" &&
     typeof MediaRecorder !== "undefined";
+  const isRequestActive =
+    pendingAssistantResponse || isTextStreaming || awaitingAssistantAudio || isPlayingAudio;
 
   useEffect(() => {
     return () => {
+      chatAbortControllerRef.current?.abort();
+      chatAbortControllerRef.current = null;
+      autoSpeakQueueRef.current = [];
+      autoSpeakPlayingRef.current = false;
       stopRecording(true);
       clearAudioUiHideTimeout();
       clearSttUiHideTimeout();
+      clearModelContextTimeout();
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
       cleanupAudioPlayback();
+      manualDisconnectRef.current = true;
       socketRef.current?.close();
     };
   }, []);
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== PTT_HOTKEY || event.repeat || pttHeldRef.current) {
+        return;
+      }
+
+      pttHeldRef.current = true;
+
+      if (socketStatus !== "connected") {
+        setMicError("Jarvis voice input is unavailable while disconnected.");
+        return;
+      }
+
+      if (!mediaRecorderSupported) {
+        setMicError("This runtime does not support keyboard push-to-talk recording.");
+        return;
+      }
+
+      void startRecording();
+    };
+
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.key !== PTT_HOTKEY) {
+        return;
+      }
+
+      pttHeldRef.current = false;
+      stopRecording();
+    };
+
+    const onWindowBlur = () => {
+      if (!pttHeldRef.current) {
+        return;
+      }
+
+      pttHeldRef.current = false;
+      stopRecording();
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onWindowBlur);
+
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onWindowBlur);
+    };
+  }, [socketStatus, mediaRecorderSupported, isRequestActive]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      connect();
+    }, 80);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!messagesViewportRef.current) {
+      return;
+    }
+
+    messagesViewportRef.current.scrollTo({
+      top: messagesViewportRef.current.scrollHeight,
+      behavior: "smooth"
+    });
+  }, [messages, pendingAssistantResponse]);
+
+  useEffect(() => {
+    let isDisposed = false;
+
+    async function hydrateStatus(): Promise<void> {
+      try {
+        const response = await fetch(`${apiBaseUrl}/v1/system/status`);
+        const payload = (await response.json()) as Record<string, unknown>;
+        if (!response.ok) {
+          throw new Error(
+            typeof payload.detail === "string"
+              ? payload.detail
+              : "Jarvis could not load system status."
+          );
+        }
+
+        if (isDisposed) {
+          return;
+        }
+
+        const serverMode =
+          payload.active_mode === "performance" || payload.active_mode === "eco"
+            ? (payload.active_mode as PowerMode)
+            : "eco";
+        const serverModel = typeof payload.active_model === "string" ? payload.active_model : "";
+        setCurrentMode(serverMode);
+        setActiveModel(serverModel);
+        window.localStorage.setItem(POWER_MODE_STORAGE_KEY, serverMode);
+        setStatusLoadError("");
+      } catch (error: unknown) {
+        if (isDisposed) {
+          return;
+        }
+        setStatusLoadError(
+          error instanceof Error ? error.message : "Jarvis could not load the current power mode status."
+        );
+      }
+    }
+
+    void hydrateStatus();
+    return () => {
+      isDisposed = true;
+    };
+  }, [apiBaseUrl]);
+
   function pushMessage(message: ChatMessage): void {
     setMessages((current) => [...current, message]);
+  }
+
+  function updateMessageContent(messageId: string, content: string): void {
+    setMessages((current) =>
+      current.map((message) => (message.id === messageId ? { ...message, content } : message))
+    );
+  }
+
+  function appendMessageContent(messageId: string, delta: string): void {
+    setMessages((current) =>
+      current.map((message) =>
+        message.id === messageId ? { ...message, content: `${message.content}${delta}` } : message
+      )
+    );
+  }
+
+  function persistPowerMode(mode: PowerMode): void {
+    window.localStorage.setItem(POWER_MODE_STORAGE_KEY, mode);
+  }
+
+  function persistVoiceAutoSpeak(enabled: boolean): void {
+    window.localStorage.setItem(VOICE_AUTO_SPEAK_STORAGE_KEY, enabled ? "on" : "off");
+  }
+
+  function clearModelContextTimeout(): void {
+    if (modelContextTimeoutRef.current !== null) {
+      window.clearTimeout(modelContextTimeoutRef.current);
+      modelContextTimeoutRef.current = null;
+    }
+  }
+
+  async function handleSwitchMode(nextMode: PowerMode): Promise<void> {
+    if (isSwitchingMode || nextMode === currentMode) {
+      return;
+    }
+
+    setShowModelContext(true);
+    setIsSwitchingMode(true);
+    setStatusLoadError("");
+    setPrewarmWarning("");
+    setMicError("");
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/v1/system/model`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ mode: nextMode })
+      });
+
+      const payload = (await response.json()) as Record<string, unknown>;
+      if (!response.ok) {
+        throw new Error(
+          typeof payload.detail === "string" ? payload.detail : "Jarvis could not switch model mode."
+        );
+      }
+
+      const activeMode =
+        payload.active_mode === "performance" || payload.active_mode === "eco"
+          ? (payload.active_mode as PowerMode)
+          : nextMode;
+      const activeModelName = typeof payload.active_model === "string" ? payload.active_model : "";
+      const warning = typeof payload.prewarm_warning === "string" ? payload.prewarm_warning : "";
+
+      setCurrentMode(activeMode);
+      setActiveModel(activeModelName);
+      persistPowerMode(activeMode);
+      setPrewarmWarning(warning);
+
+      pushMessage({
+        id: `mode-switch-${Date.now()}`,
+        role: "system",
+        label: "Power",
+        content:
+          typeof payload.message === "string"
+            ? payload.message
+            : `Switched to ${activeMode === "performance" ? "Performance" : "Eco"} mode.`
+      });
+    } catch (error: unknown) {
+      const message =
+        error instanceof Error ? error.message : "Jarvis could not switch model mode right now.";
+      setStatusLoadError(message);
+      pushMessage({
+        id: `mode-switch-error-${Date.now()}`,
+        role: "system",
+        label: "Power",
+        content: message
+      });
+    } finally {
+      setIsSwitchingMode(false);
+      setTransportNotice("");
+      clearModelContextTimeout();
+      modelContextTimeoutRef.current = window.setTimeout(() => {
+        setShowModelContext(false);
+        modelContextTimeoutRef.current = null;
+      }, 950);
+    }
   }
 
   function cleanupMediaStream(): void {
@@ -201,10 +471,14 @@ function App() {
       activeAudioUrlRef.current = "";
     }
 
+    setManualListenMessageId("");
     setIsPlayingAudio(false);
   }
 
-  async function playAssistantAudio(payload: AssistantAudioPayload): Promise<void> {
+  async function playAssistantAudio(
+    payload: AssistantAudioPayload,
+    onPlaybackComplete?: () => void
+  ): Promise<void> {
     cleanupAudioPlayback();
 
     try {
@@ -238,6 +512,7 @@ function App() {
           return;
         }
         cleanupAudioPlayback();
+        onPlaybackComplete?.();
       };
       audio.onerror = () => {
         if (playbackToken !== activeAudioTokenRef.current || audioLoadConfirmedRef.current) {
@@ -245,6 +520,7 @@ function App() {
         }
 
         scheduleAudioError("Jarvis could not play the assistant audio reply.", playbackToken);
+        onPlaybackComplete?.();
       };
 
       await audio.play();
@@ -252,6 +528,7 @@ function App() {
     } catch (error: unknown) {
       const isAbortError = error instanceof DOMException && error.name === "AbortError";
       if (isAbortError) {
+        onPlaybackComplete?.();
         return;
       }
 
@@ -259,6 +536,247 @@ function App() {
       showAudioUiError(
         error instanceof Error ? error.message : "Jarvis encountered an unexpected audio playback error."
       );
+      onPlaybackComplete?.();
+    }
+  }
+
+  function clearAutoSpeakQueue(): void {
+    autoSpeakQueueRef.current = [];
+    autoSpeakPlayingRef.current = false;
+    setAwaitingAssistantAudio(false);
+  }
+
+  function playNextAutoSpeakAudio(): void {
+    if (autoSpeakPlayingRef.current) {
+      return;
+    }
+
+    const nextAudio = autoSpeakQueueRef.current.shift();
+    if (!nextAudio) {
+      setAwaitingAssistantAudio(false);
+      return;
+    }
+
+    autoSpeakPlayingRef.current = true;
+    setAwaitingAssistantAudio(true);
+
+    void playAssistantAudio(nextAudio, () => {
+      autoSpeakPlayingRef.current = false;
+      if (autoSpeakQueueRef.current.length === 0) {
+        setAwaitingAssistantAudio(false);
+        return;
+      }
+      playNextAutoSpeakAudio();
+    });
+  }
+
+  function enqueueAutoSpeakAudio(payload: AssistantAudioPayload): void {
+    autoSpeakQueueRef.current.push(payload);
+    playNextAutoSpeakAudio();
+  }
+
+  async function handleManualListen(messageId: string, text: string): Promise<void> {
+    const content = text.trim();
+    if (!content) {
+      return;
+    }
+
+    clearAutoSpeakQueue();
+    cleanupAudioPlayback();
+    setManualListenMessageId(messageId);
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/v1/synthesize`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ text: content })
+      });
+
+      const payload = (await response.json()) as Record<string, unknown>;
+      if (!response.ok) {
+        throw new Error(
+          typeof payload.detail === "string"
+            ? payload.detail
+            : "Jarvis could not synthesize this message right now."
+        );
+      }
+
+      if (
+        typeof payload.audio_base64 !== "string" ||
+        typeof payload.mime_type !== "string" ||
+        typeof payload.voice !== "string"
+      ) {
+        throw new Error("Jarvis returned an invalid manual synthesis payload.");
+      }
+
+      await playAssistantAudio(
+        {
+          audio_base64: payload.audio_base64,
+          mime_type: payload.mime_type,
+          voice: payload.voice
+        },
+        () => {
+          setManualListenMessageId("");
+        }
+      );
+    } catch (error: unknown) {
+      setManualListenMessageId("");
+      showAudioUiError(
+        error instanceof Error ? error.message : "Jarvis could not play the selected message audio."
+      );
+    }
+  }
+
+  async function streamChatOverHttp(userText: string, assistantMessageId: string): Promise<void> {
+    const requestController = new AbortController();
+    chatAbortControllerRef.current = requestController;
+    activeHttpAssistantMessageIdRef.current = assistantMessageId;
+
+    setPendingAssistantResponse(true);
+    setIsTextStreaming(false);
+    setAwaitingAssistantAudio(false);
+    setTransportNotice(currentMode === "performance" ? "Processing in Performance mode..." : "");
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/v1/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          message: userText,
+          auto_speak: voiceAutoSpeak,
+          session_id: sessionId || undefined
+        }),
+        signal: requestController.signal
+      });
+
+      if (!response.ok) {
+        const payload = (await response.json()) as Record<string, unknown>;
+        throw new Error(
+          typeof payload.detail === "string"
+            ? payload.detail
+            : "Jarvis could not process this request right now."
+        );
+      }
+
+      if (!response.body) {
+        throw new Error("Jarvis returned an empty stream response.");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (!trimmedLine) {
+            continue;
+          }
+
+          let event: Record<string, unknown>;
+          try {
+            event = JSON.parse(trimmedLine) as Record<string, unknown>;
+          } catch {
+            continue;
+          }
+
+          if (typeof event.session_id === "string" && event.session_id.length > 0) {
+            setSessionId(event.session_id);
+          }
+
+          const eventType = typeof event.type === "string" ? event.type : "";
+          if (eventType === "text.chunk") {
+            const delta = typeof event.delta === "string" ? event.delta : "";
+            if (delta) {
+              setPendingAssistantResponse(false);
+              setIsTextStreaming(true);
+              appendMessageContent(assistantMessageId, delta);
+            }
+            continue;
+          }
+
+          if (eventType === "audio.ready" && voiceAutoSpeak) {
+            if (
+              typeof event.audio_base64 === "string" &&
+              typeof event.mime_type === "string" &&
+              typeof event.voice === "string"
+            ) {
+              enqueueAutoSpeakAudio({
+                audio_base64: event.audio_base64,
+                mime_type: event.mime_type,
+                voice: event.voice
+              });
+            }
+            continue;
+          }
+
+          if (eventType === "final") {
+            const finalText = typeof event.text === "string" ? event.text.trim() : "";
+            if (finalText.length > 0) {
+              updateMessageContent(assistantMessageId, finalText);
+            }
+            setPendingAssistantResponse(false);
+            setIsTextStreaming(false);
+            if (!voiceAutoSpeak || (autoSpeakQueueRef.current.length === 0 && !autoSpeakPlayingRef.current)) {
+              setAwaitingAssistantAudio(false);
+            }
+            continue;
+          }
+
+          if (eventType === "error") {
+            const message =
+              typeof event.message === "string"
+                ? event.message
+                : "Jarvis encountered an unexpected streaming error.";
+            pushMessage({
+              id: `stream-error-${Date.now()}`,
+              role: "system",
+              label: "Error",
+              content: message
+            });
+            setPendingAssistantResponse(false);
+            setIsTextStreaming(false);
+            continue;
+          }
+        }
+      }
+    } catch (error: unknown) {
+      const isAbortError = error instanceof DOMException && error.name === "AbortError";
+      if (!isAbortError) {
+        pushMessage({
+          id: `http-chat-error-${Date.now()}`,
+          role: "system",
+          label: "Error",
+          content:
+            error instanceof Error
+              ? error.message
+              : "Jarvis could not complete the HTTP chat request."
+        });
+      }
+    } finally {
+      if (chatAbortControllerRef.current === requestController) {
+        chatAbortControllerRef.current = null;
+      }
+      activeHttpAssistantMessageIdRef.current = null;
+      setPendingAssistantResponse(false);
+      setIsTextStreaming(false);
+      if (autoSpeakQueueRef.current.length === 0 && !autoSpeakPlayingRef.current) {
+        setAwaitingAssistantAudio(false);
+      }
+      setTransportNotice("");
     }
   }
 
@@ -267,12 +785,20 @@ function App() {
       return;
     }
 
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+
+    manualDisconnectRef.current = false;
+    setTransportNotice("Connecting...");
     setSocketStatus("connecting");
     const socket = new WebSocket(wsUrl);
     socketRef.current = socket;
 
     socket.onopen = () => {
       setSocketStatus("connected");
+      setTransportNotice("");
       socket.send(
         JSON.stringify({
           type: "session.start",
@@ -329,11 +855,71 @@ function App() {
           typeof payload.mime_type === "string" &&
           typeof payload.voice === "string"
         ) {
+          setAwaitingAssistantAudio(false);
           clearSttUiError();
           void playAssistantAudio(payload as AssistantAudioPayload);
         } else {
+          setAwaitingAssistantAudio(false);
           showAudioUiError("Jarvis returned an invalid assistant audio payload.");
         }
+        return;
+      }
+
+      if (data.type === "text.stream.start") {
+        const streamId = typeof data.payload.stream_id === "string" ? data.payload.stream_id : "";
+        if (!streamId) {
+          return;
+        }
+
+        const messageId = `assistant-stream-${streamId}`;
+        activeStreamIdRef.current = streamId;
+        activeStreamMessageIdRef.current = messageId;
+        setIsTextStreaming(true);
+        setPendingAssistantResponse(false);
+        setAwaitingAssistantAudio(false);
+        setTransportNotice("");
+        clearSttUiError();
+
+        pushMessage({
+          id: messageId,
+          role: "assistant",
+          label: "Jarvis",
+          content: ""
+        });
+        return;
+      }
+
+      if (data.type === "text.stream.delta") {
+        const streamId = typeof data.payload.stream_id === "string" ? data.payload.stream_id : "";
+        const delta = typeof data.payload.delta === "string" ? data.payload.delta : "";
+        const activeStreamId = activeStreamIdRef.current;
+        const activeMessageId = activeStreamMessageIdRef.current;
+
+        if (!streamId || !delta || !activeStreamId || streamId !== activeStreamId || !activeMessageId) {
+          return;
+        }
+
+        appendMessageContent(activeMessageId, delta);
+        return;
+      }
+
+      if (data.type === "text.stream.end") {
+        const streamId = typeof data.payload.stream_id === "string" ? data.payload.stream_id : "";
+        const finalText = typeof data.payload.text === "string" ? data.payload.text : "";
+        const activeStreamId = activeStreamIdRef.current;
+        const activeMessageId = activeStreamMessageIdRef.current;
+
+        if (!streamId || !activeStreamId || streamId !== activeStreamId || !activeMessageId) {
+          return;
+        }
+
+        if (finalText.trim().length > 0) {
+          updateMessageContent(activeMessageId, finalText.trim());
+        }
+
+        setIsTextStreaming(false);
+        setAwaitingAssistantAudio(true);
+        // Keep stream refs until text.output arrives so we can finalize without duplicating the message.
         return;
       }
 
@@ -342,9 +928,43 @@ function App() {
         if (textOut.length > 0) {
           clearSttUiError();
         }
+
+        const activeStreamMessageId = activeStreamMessageIdRef.current;
+        if (activeStreamMessageId) {
+          if (textOut.length > 0) {
+            updateMessageContent(activeStreamMessageId, textOut);
+          }
+
+          activeStreamIdRef.current = null;
+          activeStreamMessageIdRef.current = null;
+          setIsTextStreaming(false);
+          setPendingAssistantResponse(false);
+          setAwaitingAssistantAudio(true);
+          setTransportNotice("");
+          return;
+        }
+
+        setPendingAssistantResponse(false);
+        setAwaitingAssistantAudio(true);
+        setTransportNotice("");
+        if (textOut.length > 0) {
+          pushMessage({
+            id: `text-output-${Date.now()}`,
+            role: "assistant",
+            label: "Jarvis",
+            content: textOut
+          });
+        }
+        return;
       }
 
       if (data.type === "error") {
+        activeStreamIdRef.current = null;
+        activeStreamMessageIdRef.current = null;
+        setIsTextStreaming(false);
+        setPendingAssistantResponse(false);
+        setAwaitingAssistantAudio(false);
+        setTransportNotice("");
         const errorMessage = typeof data.payload.message === "string" ? data.payload.message : "";
         const normalized = errorMessage.toLowerCase();
         const isSttError =
@@ -375,6 +995,7 @@ function App() {
     };
 
     socket.onerror = () => {
+      setTransportNotice("Connection unstable. Retrying...");
       pushMessage({
         id: `socket-error-${Date.now()}`,
         role: "system",
@@ -385,15 +1006,37 @@ function App() {
 
     socket.onclose = () => {
       stopRecording(true);
+      clearAutoSpeakQueue();
       cleanupAudioPlayback();
+      activeStreamIdRef.current = null;
+      activeStreamMessageIdRef.current = null;
+      setIsTextStreaming(false);
+      setPendingAssistantResponse(false);
+      setAwaitingAssistantAudio(false);
       setSocketStatus("disconnected");
       socketRef.current = null;
+
+      if (!manualDisconnectRef.current) {
+        setTransportNotice("Disconnected. Reconnecting...");
+        reconnectTimerRef.current = window.setTimeout(() => {
+          reconnectTimerRef.current = null;
+          connect();
+        }, 1200);
+      }
     };
   }
 
   function disconnect(): void {
     stopRecording(true);
+    clearAutoSpeakQueue();
     cleanupAudioPlayback();
+    manualDisconnectRef.current = true;
+    setTransportNotice("Disconnected");
+
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
 
     const socket = socketRef.current;
     if (!socket) {
@@ -422,13 +1065,20 @@ function App() {
         id: `audio-socket-missing-${Date.now()}`,
         role: "system",
         label: "Mic",
-        content: "Connect to Jarvis before sending microphone audio."
+        content: "Connect to Jarvis before using keyboard push-to-talk."
       });
+      setMicError("Keyboard push-to-talk failed because Jarvis is disconnected.");
+      return;
+    }
+
+    if (isRequestActive) {
+      setMicError("Wait until Jarvis finishes the current response before sending voice input.");
       return;
     }
 
     try {
       const audioBase64 = await blobToBase64(audioBlob);
+      setPendingAssistantResponse(true);
       socket.send(
         JSON.stringify({
           type: "audio.chunk",
@@ -441,6 +1091,8 @@ function App() {
         } satisfies Envelope)
       );
     } catch (error: unknown) {
+      setPendingAssistantResponse(false);
+      setAwaitingAssistantAudio(false);
       pushMessage({
         id: `audio-send-error-${Date.now()}`,
         role: "system",
@@ -455,6 +1107,11 @@ function App() {
 
   async function startRecording(): Promise<void> {
     if (isRecording || socketStatus !== "connected") {
+      return;
+    }
+
+    if (isRequestActive) {
+      setMicError("Wait until Jarvis finishes the current response before recording.");
       return;
     }
 
@@ -544,10 +1201,19 @@ function App() {
 
   function handleSubmit(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault();
-    const socket = socketRef.current;
     const trimmedValue = inputValue.trim();
 
-    if (!socket || socket.readyState !== WebSocket.OPEN || !trimmedValue) {
+    if (!trimmedValue) {
+      return;
+    }
+
+    if (isRequestActive) {
+      pushMessage({
+        id: `busy-${Date.now()}`,
+        role: "system",
+        label: "System",
+        content: "Jarvis is still handling the previous request. Please wait or press Interrupt."
+      });
       return;
     }
 
@@ -558,201 +1224,264 @@ function App() {
       content: trimmedValue
     });
 
-    socket.send(
-      JSON.stringify({
-        type: "text.input",
-        payload: {
-          text: trimmedValue
-        },
-        session_id: sessionId
-      } satisfies Envelope)
-    );
+    const assistantMessageId = `assistant-http-${Date.now()}`;
+    pushMessage({
+      id: assistantMessageId,
+      role: "assistant",
+      label: "Jarvis",
+      content: ""
+    });
 
+    clearAutoSpeakQueue();
+    cleanupAudioPlayback();
+    void streamChatOverHttp(trimmedValue, assistantMessageId);
     setInputValue("");
   }
 
+  function interruptCurrentRequest(): void {
+    if (!isRequestActive && !isRecording && socketStatus !== "connecting") {
+      return;
+    }
+
+    stopRecording(true);
+    chatAbortControllerRef.current?.abort();
+    chatAbortControllerRef.current = null;
+    activeHttpAssistantMessageIdRef.current = null;
+    clearAutoSpeakQueue();
+    cleanupAudioPlayback();
+    activeStreamIdRef.current = null;
+    activeStreamMessageIdRef.current = null;
+    setPendingAssistantResponse(false);
+    setIsTextStreaming(false);
+    setAwaitingAssistantAudio(false);
+    setTransportNotice("Interrupted. Reconnecting...");
+
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+
+    const socket = socketRef.current;
+    if (!socket || socket.readyState === WebSocket.CLOSED) {
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        connect();
+      }, 120);
+    } else {
+      manualDisconnectRef.current = true;
+      socket.close(1000, "interrupt");
+      socketRef.current = null;
+      setSocketStatus("disconnected");
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        connect();
+      }, 120);
+    }
+
+    pushMessage({
+      id: `interrupt-${Date.now()}`,
+      role: "system",
+      label: "System",
+      content: "Current request interrupted."
+    });
+  }
+
   return (
-    <main className="min-h-screen px-4 py-6 text-ink sm:px-8">
+    <main className="minimal-root min-h-screen px-4 py-5 text-[#f5f5f5] sm:px-8">
+      {currentMode === "performance" && pendingAssistantResponse && <div className="top-progress-bar" />}
       <motion.section
         initial={{ opacity: 0, y: 24 }}
         animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.45, ease: "easeOut" }}
-        className="mx-auto flex min-h-[calc(100vh-3rem)] w-full max-w-6xl flex-col gap-6 rounded-[32px] border border-white/10 bg-white/5 p-6 shadow-glow backdrop-blur-xl"
+        transition={{ duration: 0.35, ease: "easeOut" }}
+        className="mx-auto flex min-h-[calc(100vh-2.5rem)] w-full max-w-5xl flex-col rounded-2xl border border-[#222] bg-[#0f0f0f]"
       >
-        <header className="flex flex-col gap-4 border-b border-white/10 pb-6 md:flex-row md:items-end md:justify-between">
-          <div className="space-y-3">
-            <p className="text-sm uppercase tracking-[0.35em] text-accent/80">Local Voice AI Assistant</p>
-            <div>
-              <h1 className="text-4xl font-semibold tracking-tight sm:text-5xl">Jarvis</h1>
-              <p className="mt-2 max-w-2xl text-sm text-slate-300 sm:text-base">
-                Phase 3.1 keeps voice I/O and runs the conversational brain on local Ollama for privacy and
-                rate-limit-free responses.
-              </p>
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-3">
+        <header className="flex items-center justify-between border-b border-[#222] px-4 py-3 sm:px-5">
+          <div className="flex min-h-[20px] items-center gap-2">
             <span
-              className={`rounded-full px-4 py-2 text-xs font-semibold uppercase tracking-[0.24em] ${
+              className={`h-1.5 w-1.5 rounded-full ${
                 socketStatus === "connected"
-                  ? "bg-emerald-500/15 text-emerald-200"
+                  ? "bg-[#8ea7c4]"
                   : socketStatus === "connecting"
-                    ? "bg-amber-500/15 text-amber-200"
-                    : "bg-slate-500/15 text-slate-200"
+                    ? "bg-[#85725c]"
+                    : "bg-[#565656]"
               }`}
-            >
-              {socketStatus}
-            </span>
-            <span
-              className={`rounded-full px-4 py-2 text-xs font-semibold uppercase tracking-[0.24em] ${
-                isPlayingAudio ? "bg-cyan-500/15 text-cyan-200" : "bg-slate-500/15 text-slate-300"
-              }`}
-            >
-              {isPlayingAudio ? "playing audio" : "audio idle"}
-            </span>
-            <button
-              type="button"
-              onClick={connect}
-              className="rounded-full bg-accent px-5 py-3 text-sm font-semibold text-slate-950 transition hover:scale-[1.01]"
-            >
-              Connect
-            </button>
-            <button
-              type="button"
-              onClick={disconnect}
-              className="rounded-full border border-white/15 px-5 py-3 text-sm font-semibold text-white transition hover:bg-white/10"
-            >
-              Disconnect
-            </button>
+            />
+            {showModelContext || isSwitchingMode ? (
+              <p className="text-[12px] text-[#a7a7a7]">
+                Model: <span className="font-mono text-[11px] text-[#d2d2d2]">{activeModel || "updating"}</span>
+              </p>
+            ) : null}
+            {!showModelContext && !isSwitchingMode && transportNotice ? (
+              <p className="text-[12px] text-[#8e8e8e]">{transportNotice}</p>
+            ) : null}
           </div>
+          <PowerController
+            currentMode={currentMode}
+            isSwitchingMode={isSwitchingMode}
+            onSwitch={(mode) => {
+              void handleSwitchMode(mode);
+            }}
+          />
         </header>
 
-        <section className="grid flex-1 gap-6 lg:grid-cols-[1.5fr_0.8fr]">
-          <div className="flex min-h-[28rem] flex-col rounded-[28px] border border-white/10 bg-panel/80 p-4">
-            <div className="mb-4 flex items-center justify-between">
-              <h2 className="text-lg font-semibold">Conversation</h2>
-              <span className="text-xs uppercase tracking-[0.3em] text-slate-400">
-                Session {sessionId || "pending"}
-              </span>
-            </div>
-
-            {(audioUiError || sttUiError) && (
-              <div className="mb-3 space-y-2">
-                {audioUiError && (
-                  <div className="rounded-2xl border border-amber-300/30 bg-amber-500/10 px-4 py-2 text-sm text-amber-100">
-                    {audioUiError}
-                  </div>
-                )}
-                {sttUiError && (
-                  <div className="rounded-2xl border border-rose-300/30 bg-rose-500/10 px-4 py-2 text-sm text-rose-100">
-                    {sttUiError}
-                  </div>
-                )}
-              </div>
-            )}
-
-            <div className="flex-1 space-y-3 overflow-y-auto pr-2">
+        <section className="flex flex-1 flex-col">
+          <div ref={messagesViewportRef} className="flex-1 overflow-y-auto px-5 py-7 sm:px-8">
+            <div className="mx-auto max-w-3xl space-y-7">
               {messages.map((message) => (
                 <motion.article
                   key={message.id}
-                  initial={{ opacity: 0, y: 10 }}
+                  initial={{ opacity: 0, y: 6 }}
                   animate={{ opacity: 1, y: 0 }}
-                  className={`rounded-3xl px-4 py-3 ${
-                    message.role === "user"
-                      ? "ml-auto max-w-[80%] bg-accent text-slate-950"
-                      : message.role === "assistant"
-                        ? "max-w-[85%] bg-white/8 text-white"
-                        : "max-w-[85%] border border-white/10 bg-white/5 text-slate-200"
-                  }`}
+                  className="relative space-y-1"
                 >
-                  <p className="mb-2 text-[11px] uppercase tracking-[0.28em] opacity-70">{message.label}</p>
-                  <p className="whitespace-pre-wrap text-sm leading-6">{message.content}</p>
+                  <p className="text-[11px] uppercase tracking-[0.18em] text-[#7d7d7d]">{message.label}</p>
+                  <p
+                    className={`whitespace-pre-wrap text-[15px] leading-7 ${
+                      message.role === "user"
+                        ? "text-white"
+                        : message.role === "assistant"
+                          ? "text-[#e0e0e0]"
+                          : "font-mono text-[12px] leading-6 text-[#a5a5a5]"
+                    }`}
+                  >
+                    {message.content}
+                  </p>
+                  {message.role === "assistant" && message.content.trim().length > 0 ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void handleManualListen(message.id, message.content);
+                      }}
+                      className={`absolute bottom-0 right-0 inline-flex items-center justify-center p-1 text-[#b8c2cf] transition hover:opacity-90 ${
+                        manualListenMessageId === message.id && isPlayingAudio
+                          ? "opacity-95 listening-pulse"
+                          : "opacity-30"
+                      }`}
+                      aria-label="Listen to this reply"
+                      title="Listen"
+                    >
+                      <svg viewBox="0 0 24 24" className="h-4 w-4" fill="currentColor" aria-hidden="true">
+                        <path d="M14 3.23a1 1 0 0 1 1.52.85v15.84a1 1 0 0 1-1.7.72l-4.58-4.58H5a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1h4.24l4.58-4.58A1 1 0 0 1 14 3.23Zm4.28 2.28a1 1 0 0 1 1.41 0 9 9 0 0 1 0 12.73 1 1 0 1 1-1.41-1.41 7 7 0 0 0 0-9.91 1 1 0 0 1 0-1.41Zm-2.12 2.12a1 1 0 0 1 1.41 0 6 6 0 0 1 0 8.49 1 1 0 1 1-1.41-1.41 4 4 0 0 0 0-5.66 1 1 0 0 1 0-1.42Z" />
+                      </svg>
+                    </button>
+                  ) : null}
                 </motion.article>
               ))}
+              {(pendingAssistantResponse || isTextStreaming || awaitingAssistantAudio) && (
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  transition={{ duration: 0.32, ease: "easeOut" }}
+                  className="thinking-shell"
+                >
+                  <div className="thinking-wave" aria-hidden="true">
+                    <span className="thinking-dot" />
+                    <span className="thinking-dot" />
+                    <span className="thinking-dot" />
+                  </div>
+                  <p className="thinking-label">
+                    {pendingAssistantResponse
+                      ? "Jarvis is thinking..."
+                      : isTextStreaming
+                        ? "Jarvis is composing..."
+                        : "Jarvis is preparing voice..."}
+                  </p>
+                </motion.div>
+              )}
             </div>
+          </div>
 
-            <div className="mt-4 grid gap-3 md:grid-cols-[1fr_auto]">
-              <button
-                type="button"
-                disabled={socketStatus !== "connected" || !mediaRecorderSupported}
-                onPointerDown={() => {
-                  void startRecording();
-                }}
-                onPointerUp={() => {
-                  stopRecording();
-                }}
-                onPointerLeave={() => {
-                  stopRecording();
-                }}
-                onPointerCancel={() => {
-                  stopRecording();
-                }}
-                className={`touch-none rounded-3xl px-6 py-4 text-left text-sm font-semibold transition ${
-                  isRecording
-                    ? "bg-rose-500 text-white shadow-lg shadow-rose-500/30"
-                    : "border border-white/10 bg-slate-950/60 text-white hover:bg-slate-900/80"
-                } disabled:cursor-not-allowed disabled:opacity-40`}
-              >
-                <span className="block text-[11px] uppercase tracking-[0.3em] opacity-70">Push To Talk</span>
-                <span className="mt-2 block text-base">
-                  {isRecording ? "Recording... release to send" : "Hold to record and send one voice turn"}
-                </span>
-              </button>
-
-              <div className="rounded-3xl border border-white/10 bg-slate-950/40 px-4 py-3 text-sm text-slate-300">
-                <p className="text-[11px] uppercase tracking-[0.28em] text-accent/80">Mic Status</p>
-                <p className="mt-2">
-                  {micError ||
-                    (mediaRecorderSupported
-                      ? isRecording
-                        ? "Microphone is capturing WebM audio."
-                        : "Microphone ready."
-                      : "MediaRecorder is unavailable in this runtime.")}
-                </p>
-              </div>
+          {(statusLoadError || prewarmWarning || audioUiError || sttUiError || micError) && (
+            <div className="border-t border-[#222] px-5 py-2 text-[12px] text-[#9f9f9f] sm:px-8">
+              {statusLoadError || prewarmWarning || audioUiError || sttUiError || micError}
             </div>
+          )}
 
-            <form onSubmit={handleSubmit} className="mt-4 flex flex-col gap-3 sm:flex-row">
-              <textarea
+          <div className="border-t border-[#222] px-5 py-3 sm:px-8">
+            <form onSubmit={handleSubmit} className="flex items-center gap-3 border-b border-[#2a2a2a] pb-2">
+              <input
                 value={inputValue}
                 onChange={(event) => setInputValue(event.target.value)}
-                placeholder="Send a message to Jarvis..."
-                rows={3}
-                className="min-h-[88px] flex-1 rounded-3xl border border-white/10 bg-slate-950/50 px-4 py-3 text-sm text-white outline-none ring-0 placeholder:text-slate-500"
+                placeholder="Type a command..."
+                autoComplete="off"
+                className="h-10 flex-1 bg-transparent text-[15px] text-white outline-none placeholder:text-[#5e5e5e]"
               />
               <button
+                type="button"
+                onClick={() => {
+                  const next = !voiceAutoSpeak;
+                  setVoiceAutoSpeak(next);
+                  persistVoiceAutoSpeak(next);
+                }}
+                className="text-[12px] text-[#9ea9b7] transition hover:text-[#d8e2f0]"
+              >
+                {voiceAutoSpeak ? "VOICE: ON" : "VOICE: OFF"}
+              </button>
+              <button
                 type="submit"
-                disabled={socketStatus !== "connected" || inputValue.trim().length === 0}
-                className="rounded-3xl bg-white px-6 py-3 text-sm font-semibold text-slate-950 transition disabled:cursor-not-allowed disabled:opacity-40"
+                disabled={inputValue.trim().length === 0 || isRequestActive}
+                className="text-[13px] text-[#d8d8d8] transition hover:text-white disabled:opacity-35"
               >
                 Send
               </button>
+              <button
+                type="button"
+                onClick={interruptCurrentRequest}
+                disabled={!isRequestActive && !isRecording && socketStatus !== "connecting"}
+                className="text-[13px] text-[#dca7a7] transition hover:text-[#ffd0d0] disabled:opacity-35"
+              >
+                Interrupt
+              </button>
             </form>
-          </div>
 
-          <aside className="flex flex-col gap-4 rounded-[28px] border border-white/10 bg-white/6 p-5">
-            <div className="rounded-3xl border border-white/10 bg-slate-950/40 p-4">
-              <p className="text-xs uppercase tracking-[0.28em] text-accent/80">Backend</p>
-              <p className="mt-3 text-sm text-slate-300">{wsUrl}</p>
+            <div className="mt-2">
+              <button
+                type="button"
+                onClick={() => setShowVoiceControls((current) => !current)}
+                className="text-[12px] text-[#8f8f8f] transition hover:text-[#c6c6c6]"
+              >
+                {showVoiceControls ? "Hide voice controls" : "Voice controls"}
+              </button>
             </div>
-            <div className="rounded-3xl border border-white/10 bg-slate-950/40 p-4">
-              <p className="text-xs uppercase tracking-[0.28em] text-accent/80">Supported Events</p>
-              <ul className="mt-3 space-y-2 text-sm text-slate-200">
-                <li><code>session.start</code> / <code>session.end</code></li>
-                <li><code>text.input</code> / <code>text.output</code></li>
-                <li><code>audio.chunk</code> / <code>audio.ack</code></li>
-                <li><code>speech.transcript</code> / <code>assistant_audio</code></li>
-                <li><code>error</code></li>
-              </ul>
-            </div>
-            <div className="rounded-3xl border border-white/10 bg-slate-950/40 p-4">
-              <p className="text-xs uppercase tracking-[0.28em] text-accent/80">Voice Loop</p>
-              <p className="mt-3 text-sm leading-6 text-slate-300">
-                The frontend records one WebM utterance at a time, the backend transcribes Thai speech,
-                queries local Ollama, and returns both assistant text and Thai TTS audio.
-              </p>
-            </div>
-          </aside>
+
+            {isRequestActive && (
+              <div className="mt-2 flex items-center gap-2 text-[12px] text-[#8e8e8e]">
+                <span className="h-1.5 w-1.5 rounded-full bg-[#8e8e8e] breathing-soft" />
+                {pendingAssistantResponse
+                  ? "Jarvis is generating a response..."
+                  : isTextStreaming
+                    ? "Jarvis is streaming a response..."
+                  : awaitingAssistantAudio
+                    ? "Jarvis is preparing voice response..."
+                    : "Jarvis is streaming voice response..."}
+              </div>
+            )}
+
+            {showVoiceControls && (
+              <div className="mt-2 border-t border-[#222] pt-2">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="inline-flex items-center gap-2 rounded-md border border-[#2a2a2a] px-3 py-1.5">
+                    <span className={`h-2 w-2 rounded-full ${isRecording ? "listening-pulse bg-[#7f9fbf]" : "bg-[#4a4a4a]"}`} />
+                    <span className="text-[12px] text-[#c9c9c9]">
+                      {isRequestActive
+                        ? "Busy... press Interrupt to force stop"
+                        : isRecording
+                          ? `Listening... release ${PTT_HOTKEY}`
+                          : `Hold ${PTT_HOTKEY} to talk`}
+                    </span>
+                  </div>
+                  <p className="text-[11px] font-mono text-[#7f7f7f]">
+                    {micError ||
+                      (mediaRecorderSupported
+                        ? isRecording
+                          ? "mic listening"
+                          : "mic ready"
+                        : "media recorder unavailable")}
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
         </section>
       </motion.section>
     </main>
