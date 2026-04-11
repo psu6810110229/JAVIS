@@ -92,6 +92,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_TOOL_CALL_ROUNDS = 2
 _MAX_TOOL_RESULT_CHARS = 900
+_VIRTUAL_SWITCH_MODE_TOOL = "__switch_jarvis_mode"
 
 _SYSTEM_INSTRUCTION = (
     "You are Jarvis, a proactive Windows machine agent running natively on the user's PC. "
@@ -394,6 +395,12 @@ class Orchestrator:
     def _deterministic_tool_fallback(self, user_text: str) -> tuple[str, dict[str, Any]] | None:
         normalized = user_text.lower().strip()
 
+        if re.search(r"\b(switch|change|set)\b.*\b(deep|performance)\b(?:\s+mode)?\b", normalized):
+            return _VIRTUAL_SWITCH_MODE_TOOL, {"mode": "performance"}
+
+        if re.search(r"\b(switch|change|set)\b.*\b(quick|eco)\b(?:\s+mode)?\b", normalized):
+            return _VIRTUAL_SWITCH_MODE_TOOL, {"mode": "eco"}
+
         if re.search(r"\b(open|launch|start)\b.*\bspotify\b", normalized):
             return "open_application", {"app_name": "spotify"}
 
@@ -436,10 +443,16 @@ class Orchestrator:
         if re.search(r"\bpause\b.*\bspotify\b", normalized):
             return "pause_spotify", {}
 
-        if re.search(r"\b(next|skip)\b.*\bspotify\b", normalized):
+        if (
+            (re.search(r"\b(next|skip)\b", normalized) and re.search(r"\b(spotify|music|song|track)\b", normalized))
+            or re.search(r"\bspotify\b.*\b(next|skip)\b", normalized)
+        ):
             return "next_track", {}
 
-        if re.search(r"\b(previous|back)\b.*\bspotify\b", normalized):
+        if (
+            (re.search(r"\b(previous|prev|back)\b", normalized) and re.search(r"\b(spotify|music|song|track)\b", normalized))
+            or re.search(r"\bspotify\b.*\b(previous|prev|back)\b", normalized)
+        ):
             return "previous_track", {}
 
         return None
@@ -666,6 +679,9 @@ class Orchestrator:
         verified = tool_result.get("verified")
         evidence = str(tool_result.get("evidence") or "No verification evidence.")
 
+        if tool_name == "switch_jarvis_mode" and status in {"ok", "success"}:
+            return evidence
+
         positive_claim = bool(re.search(r"\b(success|successfully|done|completed|opened|launched|playing|paused|transferred)\b", candidate_text, re.IGNORECASE))
         failed_statuses = {"failed", "error", "timeout", "not_found", "crashed", "blocked"}
         uncertain_statuses = {"partial", "unverified", "opened_no_window", "no_windows"}
@@ -788,6 +804,45 @@ class Orchestrator:
                 return final_text
 
             tool_name, tool_args = parsed
+            if tool_name == _VIRTUAL_SWITCH_MODE_TOOL:
+                requested_mode = str(tool_args.get("mode") or "").lower()
+                if requested_mode not in {"eco", "performance"}:
+                    tool_result = {
+                        "status": "failed",
+                        "verified": False,
+                        "evidence": "Unsupported mode requested.",
+                        "error": f"Unsupported mode '{requested_mode}'.",
+                    }
+                else:
+                    try:
+                        switch_result = await self.set_active_mode(requested_mode, prewarm=False)
+                        current_model_name = str(switch_result.get("active_model") or current_model_name)
+                        current_profile = self._settings.get_profile(requested_mode)
+                        tool_result = {
+                            "status": "ok",
+                            "verified": True,
+                            "evidence": str(switch_result.get("message") or "Mode switched."),
+                            "active_mode": requested_mode,
+                            "active_model": current_model_name,
+                        }
+                    except (OllamaUnavailableError, OllamaModelError, RuntimeError, ValueError) as err:
+                        tool_result = {
+                            "status": "failed",
+                            "verified": False,
+                            "evidence": f"Mode switch failed: {err}",
+                            "error": str(err),
+                        }
+
+                last_tool_name = "switch_jarvis_mode"
+                last_tool_result = tool_result
+                working_messages.append(
+                    {
+                        "role": "user",
+                        "content": self._tool_outcome_prompt(last_tool_name, tool_result),
+                    }
+                )
+                continue
+
             if not tool_registry.has_tool(tool_name):
                 working_messages.append(
                     {"role": "assistant", "content": f"Tool '{tool_name}' is unavailable."}
@@ -1022,6 +1077,76 @@ class Orchestrator:
 
                     tool_name, tool_args = parsed
                     logger.info("[HTTP streaming] Tool call detected: %s(%s)", tool_name, tool_args)
+
+                    if tool_name == _VIRTUAL_SWITCH_MODE_TOOL:
+                        requested_mode = str(tool_args.get("mode") or "").lower()
+                        if requested_mode not in {"eco", "performance"}:
+                            tool_result = {
+                                "status": "failed",
+                                "verified": False,
+                                "evidence": "Unsupported mode requested.",
+                                "error": f"Unsupported mode '{requested_mode}'.",
+                            }
+                        else:
+                            try:
+                                switch_result = await self.set_active_mode(requested_mode, prewarm=False)
+                                model_name = str(switch_result.get("active_model") or model_name)
+                                profile = self._settings.get_profile(requested_mode)
+                                http_num_thread = HTTP_CHAT_NUM_THREAD.get(profile.mode, profile.num_thread)
+                                effective_profile = PERFORMANCE_PROFILE.__class__(
+                                    mode=profile.mode,
+                                    num_ctx=profile.num_ctx,
+                                    num_thread=http_num_thread,
+                                    num_gpu=profile.num_gpu,
+                                    description=profile.description,
+                                )
+                                tool_result = {
+                                    "status": "ok",
+                                    "verified": True,
+                                    "evidence": str(switch_result.get("message") or "Mode switched."),
+                                    "active_mode": requested_mode,
+                                    "active_model": model_name,
+                                }
+                            except (OllamaUnavailableError, OllamaModelError, RuntimeError, ValueError) as err:
+                                tool_result = {
+                                    "status": "failed",
+                                    "verified": False,
+                                    "evidence": f"Mode switch failed: {err}",
+                                    "error": str(err),
+                                }
+
+                        last_tool_name = "switch_jarvis_mode"
+                        last_tool_result = tool_result
+                        working_messages.append(
+                            {"role": "user", "content": self._tool_outcome_prompt(last_tool_name, tool_result)}
+                        )
+                        # Generate follow-up response after virtual switch outcome.
+                        protocol_messages = self._inject_tool_protocol(working_messages, force=True)
+                        protocol_messages = self._inject_system_context(protocol_messages, personalization_prompt)
+                        try:
+                            final_text = await self._ollama.generate_streaming(
+                                protocol_messages,
+                                model_name,
+                                effective_profile,
+                                on_delta=streamer.on_delta,
+                                num_gpu=self._resolve_num_gpu(effective_profile.mode),
+                                num_ctx_override=num_ctx_override,
+                            )
+                            trailing = streamer.get_trailing_sentence_buffer()
+                            await streamer.flush_final(trailing_buffer=trailing)
+                            final_text = final_text.strip()
+                            final_text = self._enforce_claim_integrity(last_tool_name, tool_result, final_text)
+                        except (OllamaUnavailableError, OllamaModelError, OllamaResponseError, RuntimeError) as err:
+                            logger.warning(
+                                "[HTTP streaming] Ollama unavailable after virtual tool '%s'; using deterministic fallback: %s",
+                                last_tool_name,
+                                err,
+                            )
+                            self._ollama_available = False
+                            self._initialization_error = str(err)
+                            final_text = self._tool_only_fallback_text(last_tool_name, tool_result)
+                        working_messages.append({"role": "assistant", "content": final_text})
+                        continue
 
                     if not tool_registry.has_tool(tool_name):
                         working_messages.append(
