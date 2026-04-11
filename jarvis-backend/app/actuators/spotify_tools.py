@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,8 @@ _SPOTIFY_SCOPE = os.getenv(
     "user-read-playback-state user-modify-playback-state user-read-currently-playing",
 )
 _CACHE_PATH = str(Path(__file__).resolve().parent.parent.parent.parent / ".spotify_cache")
+_VERIFY_TIMEOUT_SECONDS = 2.0
+_VERIFY_POLL_INTERVAL = 0.4
 
 
 def _get_spotify() -> Any:
@@ -43,7 +46,7 @@ def _get_spotify() -> Any:
 
     client_id = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
     client_secret = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
-    redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8888/callback").strip()
+    redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback").strip()
 
     if not client_id or not client_secret:
         raise RuntimeError(
@@ -80,6 +83,58 @@ def _safe_spotify_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
         raise RuntimeError(f"Spotify error: {err}") from err
 
 
+def _read_playback_state(sp: Any) -> dict[str, Any]:
+    current = _safe_spotify_call(sp.current_playback)
+    if current is None:
+        return {"playing": False, "device": None, "track": None, "volume_percent": None}
+
+    item = current.get("item") or {}
+    device = current.get("device") or {}
+    return {
+        "playing": bool(current.get("is_playing", False)),
+        "device": device.get("name"),
+        "device_id": device.get("id"),
+        "track": item.get("name"),
+        "track_id": item.get("id"),
+        "volume_percent": device.get("volume_percent"),
+    }
+
+
+def _verify_playback_state(
+    sp: Any,
+    *,
+    expect_playing: bool | None = None,
+    expect_volume: int | None = None,
+    expect_device_id: str | None = None,
+) -> tuple[bool, str, dict[str, Any]]:
+    deadline = time.monotonic() + _VERIFY_TIMEOUT_SECONDS
+    last_state: dict[str, Any] = {}
+
+    while time.monotonic() < deadline:
+        last_state = _read_playback_state(sp)
+
+        checks: list[bool] = []
+        if expect_playing is not None:
+            checks.append(bool(last_state.get("playing")) == expect_playing)
+        if expect_volume is not None:
+            actual = last_state.get("volume_percent")
+            checks.append(isinstance(actual, int) and abs(actual - expect_volume) <= 2)
+        if expect_device_id is not None:
+            checks.append(str(last_state.get("device_id") or "") == expect_device_id)
+
+        if checks and all(checks):
+            return True, "Spotify playback state matches the requested action.", last_state
+
+        # Polling is intentionally short to keep command latency low.
+        time_left = deadline - time.monotonic()
+        if time_left > 0:
+            sleep_for = _VERIFY_POLL_INTERVAL if time_left > _VERIFY_POLL_INTERVAL else time_left
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+
+    return False, "Spotify API did not confirm the requested playback state in time.", last_state
+
+
 # ── play_spotify ──────────────────────────────────────────────────────────────
 
 @tool(
@@ -92,12 +147,15 @@ def _safe_spotify_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
 )
 async def play_spotify() -> dict[str, Any]:
     """Resume playback."""
-    def _play() -> dict[str, Any]:
-        sp = _get_spotify()
-        _safe_spotify_call(sp.start_playback)
-        return {"status": "playing"}
-
-    return await asyncio.to_thread(_play)
+    sp = await asyncio.to_thread(_get_spotify)
+    await asyncio.to_thread(_safe_spotify_call, sp.start_playback)
+    verified, evidence, state = await asyncio.to_thread(_verify_playback_state, sp, expect_playing=True)
+    return {
+        "status": "playing" if verified else "unverified",
+        "verified": verified,
+        "evidence": evidence,
+        "playback": state,
+    }
 
 
 # ── pause_spotify ─────────────────────────────────────────────────────────────
@@ -112,12 +170,15 @@ async def play_spotify() -> dict[str, Any]:
 )
 async def pause_spotify() -> dict[str, Any]:
     """Pause playback."""
-    def _pause() -> dict[str, Any]:
-        sp = _get_spotify()
-        _safe_spotify_call(sp.pause_playback)
-        return {"status": "paused"}
-
-    return await asyncio.to_thread(_pause)
+    sp = await asyncio.to_thread(_get_spotify)
+    await asyncio.to_thread(_safe_spotify_call, sp.pause_playback)
+    verified, evidence, state = await asyncio.to_thread(_verify_playback_state, sp, expect_playing=False)
+    return {
+        "status": "paused" if verified else "unverified",
+        "verified": verified,
+        "evidence": evidence,
+        "playback": state,
+    }
 
 
 # ── next_track ────────────────────────────────────────────────────────────────
@@ -132,12 +193,23 @@ async def pause_spotify() -> dict[str, Any]:
 )
 async def next_track() -> dict[str, Any]:
     """Skip to next track."""
-    def _next() -> dict[str, Any]:
-        sp = _get_spotify()
-        _safe_spotify_call(sp.next_track)
-        return {"status": "skipped_to_next"}
-
-    return await asyncio.to_thread(_next)
+    sp = await asyncio.to_thread(_get_spotify)
+    before = await asyncio.to_thread(_read_playback_state, sp)
+    await asyncio.to_thread(_safe_spotify_call, sp.next_track)
+    await asyncio.sleep(0.6)
+    after = await asyncio.to_thread(_read_playback_state, sp)
+    verified = bool(after.get("track_id")) and after.get("track_id") != before.get("track_id")
+    return {
+        "status": "skipped_to_next" if verified else "unverified",
+        "verified": verified,
+        "evidence": (
+            "Track id changed after next-track request."
+            if verified
+            else "Spotify API did not report a track change after next-track request."
+        ),
+        "before": before,
+        "after": after,
+    }
 
 
 # ── previous_track ────────────────────────────────────────────────────────────
@@ -152,12 +224,23 @@ async def next_track() -> dict[str, Any]:
 )
 async def previous_track() -> dict[str, Any]:
     """Go to previous track."""
-    def _prev() -> dict[str, Any]:
-        sp = _get_spotify()
-        _safe_spotify_call(sp.previous_track)
-        return {"status": "skipped_to_previous"}
-
-    return await asyncio.to_thread(_prev)
+    sp = await asyncio.to_thread(_get_spotify)
+    before = await asyncio.to_thread(_read_playback_state, sp)
+    await asyncio.to_thread(_safe_spotify_call, sp.previous_track)
+    await asyncio.sleep(0.6)
+    after = await asyncio.to_thread(_read_playback_state, sp)
+    verified = bool(after.get("track_id")) and after.get("track_id") != before.get("track_id")
+    return {
+        "status": "skipped_to_previous" if verified else "unverified",
+        "verified": verified,
+        "evidence": (
+            "Track id changed after previous-track request."
+            if verified
+            else "Spotify API did not report a track change after previous-track request."
+        ),
+        "before": before,
+        "after": after,
+    }
 
 
 # ── set_spotify_volume ────────────────────────────────────────────────────────
@@ -183,12 +266,16 @@ async def set_spotify_volume(level: int) -> dict[str, Any]:
     """Set Spotify volume."""
     clamped = max(0, min(100, level))
 
-    def _set_vol() -> dict[str, Any]:
-        sp = _get_spotify()
-        _safe_spotify_call(sp.volume, clamped)
-        return {"status": "ok", "volume_percent": clamped}
-
-    return await asyncio.to_thread(_set_vol)
+    sp = await asyncio.to_thread(_get_spotify)
+    await asyncio.to_thread(_safe_spotify_call, sp.volume, clamped)
+    verified, evidence, state = await asyncio.to_thread(_verify_playback_state, sp, expect_volume=clamped)
+    return {
+        "status": "ok" if verified else "unverified",
+        "volume_percent": clamped,
+        "verified": verified,
+        "evidence": evidence,
+        "playback": state,
+    }
 
 
 # ── get_now_playing ───────────────────────────────────────────────────────────
@@ -263,8 +350,7 @@ async def search_and_play(query: str, search_type: str = "track") -> dict[str, A
     valid_types = {"track", "artist", "playlist", "album"}
     stype = search_type.strip().lower() if search_type.strip().lower() in valid_types else "track"
 
-    def _search_play() -> dict[str, Any]:
-        sp = _get_spotify()
+    def _search_play(sp: Any) -> dict[str, Any]:
         results = _safe_spotify_call(sp.search, q=query, type=stype, limit=1)
 
         key = f"{stype}s"
@@ -293,7 +379,18 @@ async def search_and_play(query: str, search_type: str = "track") -> dict[str, A
             _safe_spotify_call(sp.start_playback, context_uri=uri)
             return {"status": "playing", "type": stype, "name": name, "uri": uri}
 
-    return await asyncio.to_thread(_search_play)
+    sp = await asyncio.to_thread(_get_spotify)
+    result = await asyncio.to_thread(_search_play, sp)
+    if result.get("status") != "playing":
+        return result
+
+    verified, evidence, state = await asyncio.to_thread(_verify_playback_state, sp, expect_playing=True)
+    result["verified"] = verified
+    result["evidence"] = evidence
+    result["playback"] = state
+    if not verified:
+        result["status"] = "unverified"
+    return result
 
 
 # ── get_spotify_devices ───────────────────────────────────────────────────────
@@ -347,8 +444,7 @@ async def get_spotify_devices() -> dict[str, Any]:
 )
 async def transfer_playback(device_name: str) -> dict[str, Any]:
     """Transfer Spotify playback to a named device."""
-    def _transfer() -> dict[str, Any]:
-        sp = _get_spotify()
+    def _transfer(sp: Any) -> dict[str, Any]:
         result = _safe_spotify_call(sp.devices)
         devices = result.get("devices", [])
 
@@ -368,4 +464,19 @@ async def transfer_playback(device_name: str) -> dict[str, Any]:
         _safe_spotify_call(sp.transfer_playback, device_id=match["id"], force_play=True)
         return {"status": "transferred", "device_name": match["name"], "device_id": match["id"]}
 
-    return await asyncio.to_thread(_transfer)
+    sp = await asyncio.to_thread(_get_spotify)
+    result = await asyncio.to_thread(_transfer, sp)
+    if result.get("status") != "transferred":
+        return result
+
+    verified, evidence, state = await asyncio.to_thread(
+        _verify_playback_state,
+        sp,
+        expect_device_id=str(result.get("device_id") or ""),
+    )
+    result["verified"] = verified
+    result["evidence"] = evidence
+    result["playback"] = state
+    if not verified:
+        result["status"] = "unverified"
+    return result

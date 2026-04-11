@@ -229,7 +229,7 @@ async def post_chat(payload: ChatRequestPayload) -> StreamingResponse:
         async def produce() -> None:
             final_event_sent = False
 
-            async def on_final_text(final_text: str) -> None:
+            async def on_final_text(final_text: str, last_tool_outcome: dict[str, Any] | None) -> None:
                 nonlocal final_event_sent
                 final_event_sent = True
                 await queue.put({
@@ -237,6 +237,7 @@ async def post_chat(payload: ChatRequestPayload) -> StreamingResponse:
                     "stream_id": stream_id,
                     "session_id": session_id,
                     "text": final_text,
+                    "last_tool_outcome": last_tool_outcome,
                     "timestamp": utc_timestamp(),
                 })
 
@@ -256,6 +257,7 @@ async def post_chat(payload: ChatRequestPayload) -> StreamingResponse:
                         "stream_id": stream_id,
                         "session_id": session_id,
                         "text": final_text,
+                        "last_tool_outcome": None,
                         "timestamp": utc_timestamp(),
                     })
             except (OllamaUnavailableError, OllamaModelError, RuntimeError) as err:

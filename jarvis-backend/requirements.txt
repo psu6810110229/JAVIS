@@ -21,3 +21,10 @@ spotipy==2.24.0          # Spotify Web API SDK (OAuth PKCE)
 
 # ── Web Search (free, no API key) ─────────────────────────────────────────────
 duckduckgo-search==6.3.7  # DuckDuckGo instant answers + web/news results
+
+# ── Native Windows TTS (Kokoro ONNX) ───────────────────────────────────────────
+onnxruntime-directml==1.20.1  # ONNX with DirectML for Intel iGPU/CPU
+kokoro-onnx==0.4.6           # Kokoro TTS engine
+soundfile==0.13.1            # Audio file I/O
+numpy==2.2.6                 # Required by kokoro-onnx
+tzdata==2025.2               # IANA timezone database for zoneinfo on Windows

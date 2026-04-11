@@ -17,7 +17,7 @@ function PowerController({
 
   return (
     <section className="flex items-center gap-2 rounded-full border border-[#222] bg-[#121212] p-1">
-      <div className="px-2 text-[11px] text-[#a0a0a0]">Mode</div>
+      <div className="px-2 text-[11px] text-[#a0a0a0]">Task Mode</div>
       <div className="flex items-center gap-1">
         <button
           type="button"
@@ -31,7 +31,7 @@ function PowerController({
         >
           <span className="inline-flex items-center gap-2">
             <span className="h-1.5 w-1.5 rounded-full bg-[#5e6d8d]" />
-            Eco
+            Quick
           </span>
         </button>
 
@@ -47,18 +47,18 @@ function PowerController({
         >
           <span className="inline-flex items-center gap-2">
             <span className="h-1.5 w-1.5 rounded-full bg-[#b7874e]" />
-            Performance
+            Deep
           </span>
         </button>
       </div>
 
       {isSwitchingMode && (
-        <div className="px-2 text-[11px] text-[#8f8f8f]">Reconfiguring...</div>
+        <div className="px-2 text-[11px] text-[#8f8f8f]">Switching model...</div>
       )}
 
       {!isSwitchingMode && (
         <div className={`px-2 text-[11px] ${turboModeActive ? "text-[#e9d8b2]" : "text-[#6f6f6f]"}`}>
-          {turboModeActive ? "Turbo Mode: ACTIVE" : "Turbo Mode: standby"}
+          {turboModeActive ? "High Throughput: ACTIVE" : "High Throughput: standby"}
         </div>
       )}
     </section>

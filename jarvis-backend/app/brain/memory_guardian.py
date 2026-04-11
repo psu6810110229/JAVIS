@@ -82,29 +82,11 @@ class MemoryGuardian:
                 tool_name=tool_name,
             )
 
-        if active_mode == "performance" and (
-            available_ram < self._low_ram_force_eco_bytes
-            or swap_percent > self._high_swap_force_eco_percent
-        ):
-            return GuardianDecision(
-                allowed=False,
-                reason=(
-                    "Resource pressure is high for performance mode. "
-                    "I recommend switching to eco mode before tool execution."
-                ),
-                requires_mode_confirmation=True,
-                suggested_mode="eco",
-                available_ram_bytes=available_ram,
-                pagefile_percent=pagefile_percent,
-                projected_required_ram_bytes=projected_required,
-                tool_name=tool_name,
-            )
-
         if required_mode == "performance" and active_mode != "performance":
             return GuardianDecision(
                 allowed=False,
                 reason=(
-                    f"Tool '{tool_name}' requires performance mode. "
+                    f"Tool '{tool_name}' requires the deep model mode. "
                     "I need your confirmation before switching modes."
                 ),
                 requires_mode_confirmation=True,

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import ctypes
+import difflib
 import io
 import logging
 import os
@@ -99,6 +100,12 @@ def _resolve_executable(app_name: str) -> str:
     normalized = app_name.strip().lower()
     if normalized in _APP_ALIASES:
         return _APP_ALIASES[normalized]
+
+    # Fuzzy match for typos (e.g., "exce" -> "excel", "cal" -> "calc")
+    close_matches = difflib.get_close_matches(normalized, _APP_ALIASES.keys(), n=1, cutoff=0.6)
+    if close_matches:
+        return _APP_ALIASES[close_matches[0]]
+
     # Return as-is — ShellExecute / Popen will search PATH
     return app_name.strip()
 
@@ -155,6 +162,72 @@ def _get_window_title(hwnd: int) -> str:
         return ""
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        proc = psutil.Process(pid)
+        return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+
+
+def _matching_process_pids(process_name: str) -> list[int]:
+    target = process_name.strip().lower()
+    pids: list[int] = []
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            name = str(proc.info.get("name") or "").lower()
+            if name == target:
+                pids.append(int(proc.info["pid"]))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return pids
+
+
+async def _focus_existing_window(
+    process_name: str,
+    app_name: str,
+    *,
+    timeout_seconds: float = 0.0,
+) -> dict[str, Any] | None:
+    """Find and foreground any visible window owned by *process_name*."""
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+
+    while True:
+        for existing_pid in _matching_process_pids(process_name):
+            existing_hwnd = await asyncio.to_thread(_find_hwnd_for_pid, existing_pid)
+            if existing_hwnd is None:
+                continue
+
+            await asyncio.to_thread(_bring_to_foreground, existing_hwnd)
+            window_title = await asyncio.to_thread(_get_window_title, existing_hwnd)
+            return {
+                "status": "opened",
+                "app_name": app_name,
+                "pid": existing_pid,
+                "verified": True,
+                "window_title": window_title or app_name,
+            }
+
+        if time.monotonic() >= deadline:
+            return None
+
+        await asyncio.sleep(0.25)
+
+
+def _get_volume_state_sync() -> dict[str, Any]:
+    from ctypes import POINTER, cast  # noqa: PLC0415
+
+    from comtypes import CLSCTX_ALL  # type: ignore[import]
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume  # type: ignore[import]
+
+    devices = AudioUtilities.GetSpeakers()
+    interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+    volume = cast(interface, POINTER(IAudioEndpointVolume))
+    scalar = volume.GetMasterVolumeLevelScalar()
+    muted = bool(volume.GetMute())
+    return {"volume_percent": round(scalar * 100), "muted": muted}
+
+
 # ── open_application ──────────────────────────────────────────────────────────
 
 @tool(
@@ -162,7 +235,7 @@ def _get_window_title(hwnd: int) -> str:
     description=(
         "Open a desktop application by name, wait until it is confirmed open "
         "and bring the window to the foreground. "
-        "Returns the status: 'opened', 'timeout', 'crashed', or 'not_found'."
+        "Returns the status: 'opened', 'opened_no_window', 'timeout', 'crashed', or 'not_found'."
     ),
     parameters={
         "type": "object",
@@ -177,13 +250,14 @@ def _get_window_title(hwnd: int) -> str:
         },
         "required": ["app_name"],
     },
-    risk_level="medium",
+    risk_level="low",
     category="system",
     timeout_seconds=_LAUNCH_TIMEOUT + 5,
 )
 async def open_application(app_name: str) -> dict[str, Any]:
     """Launch an application, verify it opened, and bring it to the foreground."""
     normalized = app_name.strip().lower()
+    logger.info("[open_application] Requested: '%s' (normalized: '%s')", app_name, normalized)
 
     # Blocklist check
     if normalized in _APP_BLOCKLIST or _resolve_executable(normalized).lower().replace(".exe", "") in _APP_BLOCKLIST:
@@ -194,6 +268,7 @@ async def open_application(app_name: str) -> dict[str, Any]:
         }
 
     executable = _resolve_executable(app_name)
+    logger.info("[open_application] Resolved executable: '%s'", executable)
 
     # Handle ms-settings: and similar protocol URLs
     if ":" in executable and not executable.endswith(".exe"):
@@ -239,6 +314,43 @@ async def open_application(app_name: str) -> dict[str, Any]:
         # Check if process crashed early
         ret_code = process.poll()
         if ret_code is not None and ret_code != 0:
+            resolved_name = os.path.basename(str(executable).strip().strip('"')).lower()
+            matching_pids = _matching_process_pids(resolved_name) if resolved_name else []
+            if matching_pids:
+                # Some app launchers return non-zero while delegating to an already-running instance.
+                focused = await _focus_existing_window(resolved_name, app_name, timeout_seconds=0.0)
+                if focused is not None:
+                    focused["evidence"] = (
+                        "Launcher exited early, but an existing app process/window is running "
+                        "and was brought to foreground."
+                    )
+                    return focused
+
+                if resolved_name in {"spotify.exe", "spotify"}:
+                    try:
+                        os.startfile("spotify:")  # type: ignore[attr-defined]
+                    except OSError:
+                        pass
+
+                    focused = await _focus_existing_window("spotify.exe", app_name, timeout_seconds=3.0)
+                    if focused is not None:
+                        focused["evidence"] = (
+                            "Spotify process was already running; sent spotify: protocol and brought its "
+                            "window to foreground."
+                        )
+                        return focused
+
+                return {
+                    "status": "opened_no_window",
+                    "app_name": app_name,
+                    "pid": matching_pids[0],
+                    "verified": True,
+                    "evidence": (
+                        "Launcher exited early, but matching process is running without a visible "
+                        f"top-level window. Matched process name: {resolved_name}."
+                    ),
+                }
+
             return {
                 "status": "crashed",
                 "app_name": app_name,
@@ -268,7 +380,7 @@ async def open_application(app_name: str) -> dict[str, Any]:
             break
 
     if hwnd is None:
-        # Final check: is the process at least still alive?
+        # Final check: process may be alive without a visible window (tray/background apps).
         ret_code = process.poll()
         if ret_code is not None and ret_code != 0:
             return {
@@ -278,10 +390,54 @@ async def open_application(app_name: str) -> dict[str, Any]:
                 "exit_code": ret_code,
                 "error": f"'{app_name}' crashed before a window appeared.",
             }
+
+        resolved_name = os.path.basename(str(executable).strip().strip('"')).lower()
+        matching_pids = _matching_process_pids(resolved_name) if resolved_name else []
+        if matching_pids:
+            focused = await _focus_existing_window(resolved_name, app_name, timeout_seconds=0.0)
+            if focused is not None:
+                focused["evidence"] = "Matching process/window found and brought to foreground."
+                return focused
+
+            if resolved_name in {"spotify.exe", "spotify"}:
+                try:
+                    os.startfile("spotify:")  # type: ignore[attr-defined]
+                except OSError:
+                    pass
+
+                focused = await _focus_existing_window("spotify.exe", app_name, timeout_seconds=3.0)
+                if focused is not None:
+                    focused["evidence"] = (
+                        "Spotify process was already running; sent spotify: protocol and brought its "
+                        "window to foreground."
+                    )
+                    return focused
+
+            return {
+                "status": "opened_no_window",
+                "app_name": app_name,
+                "pid": matching_pids[0],
+                "verified": True,
+                "evidence": (
+                    "Matching process is running but no visible top-level window was detected. "
+                    f"Matched process name: {resolved_name}."
+                ),
+            }
+
+        if _pid_alive(pid):
+            return {
+                "status": "opened_no_window",
+                "app_name": app_name,
+                "pid": pid,
+                "verified": True,
+                "evidence": "Process is running but no visible top-level window was detected.",
+            }
         return {
             "status": "timeout",
             "app_name": app_name,
             "pid": pid,
+            "verified": False,
+            "evidence": "No visible top-level window detected before timeout.",
             "error": (
                 f"'{app_name}' did not open a visible window within "
                 f"{_LAUNCH_TIMEOUT:.0f} seconds."
@@ -292,10 +448,14 @@ async def open_application(app_name: str) -> dict[str, Any]:
     await asyncio.to_thread(_bring_to_foreground, hwnd)
     window_title = await asyncio.to_thread(_get_window_title, hwnd)
 
+    logger.info("[open_application] Success: '%s' opened with PID %d, window: '%s'", app_name, pid, window_title)
+
     return {
         "status": "opened",
         "app_name": app_name,
         "pid": pid,
+        "verified": _pid_alive(pid),
+        "evidence": "Visible window detected and process is running.",
         "window_title": window_title or app_name,
     }
 
@@ -360,8 +520,33 @@ async def close_application(process_name: str) -> dict[str, Any]:
     if not_found:
         return {"status": "not_found", "process_name": name, "error": f"No running process named '{name}'."}
     if not closed:
-        return {"status": "no_windows", "process_name": name, "message": "Process found but no visible windows to close."}
-    return {"status": "closed", "process_name": name, "windows_closed": len(closed)}
+        return {
+            "status": "no_windows",
+            "process_name": name,
+            "verified": False,
+            "evidence": "Process found but no visible windows to close.",
+            "message": "Process found but no visible windows to close.",
+        }
+
+    await asyncio.sleep(1.5)
+    remaining_pids = _matching_process_pids(name)
+    if remaining_pids:
+        return {
+            "status": "partial",
+            "process_name": name,
+            "windows_closed": len(closed),
+            "verified": False,
+            "evidence": f"{len(remaining_pids)} process(es) still running after WM_CLOSE.",
+            "remaining_pids": remaining_pids,
+        }
+
+    return {
+        "status": "closed",
+        "process_name": name,
+        "windows_closed": len(closed),
+        "verified": True,
+        "evidence": "No matching processes remain after WM_CLOSE.",
+    }
 
 
 # ── kill_process ──────────────────────────────────────────────────────────────
@@ -423,7 +608,29 @@ async def kill_process(process_name: str = "", pid: int = 0) -> dict[str, Any]:
                 errors.append(f"Could not kill PID {proc.pid}: {err}")
 
     await asyncio.to_thread(_kill_sync)
-    return {"killed": killed, "errors": errors}
+    await asyncio.sleep(0.8)
+
+    still_alive: list[dict[str, Any]] = []
+    for entry in killed:
+        if _pid_alive(int(entry.get("pid", 0))):
+            still_alive.append(entry)
+
+    status = "killed" if killed and not still_alive else "partial" if killed else "failed"
+    verified = bool(killed) and not still_alive and not errors
+    evidence = (
+        "All targeted processes are no longer running."
+        if verified
+        else "Some targeted processes could not be terminated cleanly."
+    )
+
+    return {
+        "status": status,
+        "verified": verified,
+        "evidence": evidence,
+        "killed": killed,
+        "still_alive": still_alive,
+        "errors": errors,
+    }
 
 
 # ── get_running_processes ─────────────────────────────────────────────────────
@@ -504,7 +711,20 @@ async def set_system_volume(level: int) -> dict[str, Any]:
         volume.SetMasterVolumeLevelScalar(clamped / 100.0, None)
 
     await asyncio.to_thread(_set)
-    return {"status": "ok", "volume_percent": clamped}
+    await asyncio.sleep(0.2)
+    current = await asyncio.to_thread(_get_volume_state_sync)
+    verified = abs(int(current["volume_percent"]) - clamped) <= 2
+    return {
+        "status": "ok" if verified else "partial",
+        "volume_percent": clamped,
+        "actual_volume_percent": int(current["volume_percent"]),
+        "verified": verified,
+        "evidence": (
+            "Volume readback matches requested level."
+            if verified
+            else f"Readback volume is {current['volume_percent']} instead of {clamped}."
+        ),
+    }
 
 
 # ── get_system_volume ─────────────────────────────────────────────────────────
@@ -519,20 +739,7 @@ async def set_system_volume(level: int) -> dict[str, Any]:
 )
 async def get_system_volume() -> dict[str, Any]:
     """Return current volume and mute state."""
-    def _get() -> dict[str, Any]:
-        from ctypes import POINTER, cast  # noqa: PLC0415
-
-        from comtypes import CLSCTX_ALL  # type: ignore[import]
-        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume  # type: ignore[import]
-
-        devices = AudioUtilities.GetSpeakers()
-        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        volume = cast(interface, POINTER(IAudioEndpointVolume))
-        scalar = volume.GetMasterVolumeLevelScalar()
-        muted = bool(volume.GetMute())
-        return {"volume_percent": round(scalar * 100), "muted": muted}
-
-    return await asyncio.to_thread(_get)
+    return await asyncio.to_thread(_get_volume_state_sync)
 
 
 # ── mute_toggle ───────────────────────────────────────────────────────────────
@@ -547,6 +754,8 @@ async def get_system_volume() -> dict[str, Any]:
 )
 async def mute_toggle() -> dict[str, Any]:
     """Toggle system mute."""
+    before = await asyncio.to_thread(_get_volume_state_sync)
+
     def _toggle() -> dict[str, Any]:
         from ctypes import POINTER, cast  # noqa: PLC0415
 
@@ -560,7 +769,22 @@ async def mute_toggle() -> dict[str, Any]:
         volume.SetMute(not current, None)
         return {"muted": not current}
 
-    return await asyncio.to_thread(_toggle)
+    toggled = await asyncio.to_thread(_toggle)
+    await asyncio.sleep(0.2)
+    after = await asyncio.to_thread(_get_volume_state_sync)
+    verified = bool(before["muted"]) != bool(after["muted"])
+    return {
+        "status": "ok" if verified else "partial",
+        "muted": bool(after["muted"]),
+        "before_muted": bool(before["muted"]),
+        "requested_muted": bool(toggled["muted"]),
+        "verified": verified,
+        "evidence": (
+            "Mute state changed successfully."
+            if verified
+            else "Mute state did not change after toggle request."
+        ),
+    }
 
 
 # ── take_screenshot ───────────────────────────────────────────────────────────
@@ -637,8 +861,23 @@ async def open_path(path: str) -> dict[str, Any]:
     def _open() -> None:
         os.startfile(str(target))  # type: ignore[attr-defined]
 
-    await asyncio.to_thread(_open)
-    return {"status": "ok", "path": str(target)}
+    try:
+        await asyncio.to_thread(_open)
+    except OSError as err:
+        return {
+            "status": "failed",
+            "path": str(target),
+            "verified": False,
+            "evidence": "OS failed to dispatch the target path.",
+            "error": str(err),
+        }
+
+    return {
+        "status": "ok",
+        "path": str(target),
+        "verified": None,
+        "evidence": "Open request was dispatched to Windows shell.",
+    }
 
 
 # ── search_file ───────────────────────────────────────────────────────────────
@@ -680,8 +919,9 @@ async def search_file(
 
     max_results = max(1, min(50, max_results))
 
-    def _search() -> list[str]:
+    def _search() -> tuple[list[str], int]:
         found: list[str] = []
+        permission_errors = 0
         try:
             for match in root.rglob(pattern):
                 if match.is_file():
@@ -689,11 +929,27 @@ async def search_file(
                     if len(found) >= max_results:
                         break
         except PermissionError:
-            pass
-        return found
+            permission_errors += 1
+        return found, permission_errors
 
-    results = await asyncio.to_thread(_search)
-    return {"pattern": pattern, "search_root": str(root), "results": results, "count": len(results)}
+    results, permission_errors = await asyncio.to_thread(_search)
+    existing_results = [path for path in results if Path(path).exists()]
+    stale_count = len(results) - len(existing_results)
+    return {
+        "status": "ok",
+        "pattern": pattern,
+        "search_root": str(root),
+        "results": existing_results,
+        "count": len(existing_results),
+        "stale_count": stale_count,
+        "permission_errors": permission_errors,
+        "verified": stale_count == 0,
+        "evidence": (
+            "All returned paths exist at response time."
+            if stale_count == 0
+            else f"Filtered {stale_count} stale path(s) that no longer exist."
+        ),
+    }
 
 
 # ── read_clipboard ────────────────────────────────────────────────────────────
@@ -742,7 +998,20 @@ async def write_clipboard(text: str) -> dict[str, Any]:
         pyperclip.copy(text)
 
     await asyncio.to_thread(_write)
-    return {"status": "ok", "length": len(text)}
+    await asyncio.sleep(0.1)
+    readback = await read_clipboard()
+    verified = str(readback.get("text", "")) == text
+    return {
+        "status": "ok" if verified else "partial",
+        "length": len(text),
+        "readback_length": int(readback.get("length", 0)),
+        "verified": verified,
+        "evidence": (
+            "Clipboard readback matches the requested text."
+            if verified
+            else "Clipboard readback did not match the requested text."
+        ),
+    }
 
 
 # ── lock_workstation ──────────────────────────────────────────────────────────

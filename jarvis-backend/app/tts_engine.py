@@ -9,7 +9,8 @@ from typing import Any
 
 import requests
 
-DEFAULT_TTS_URL = "http://kokoro:8880/v1/audio/speech"
+DEFAULT_TTS_URL = "http://localhost:8870/v1/audio/speech"
+DEFAULT_TTS_FALLBACK_URL = "http://localhost:8880/v1/audio/speech"
 DEFAULT_TTS_MODE = "cpu-service"
 DEFAULT_TTS_SPEED = 1.2
 KOKORO_MODEL = "kokoro"
@@ -34,7 +35,7 @@ class KokoroTtsEngine:
         self._voice_name = KOKORO_VOICE
         self._mode = os.getenv("JARVIS_TTS_BACKEND_MODE", DEFAULT_TTS_MODE).strip() or DEFAULT_TTS_MODE
         self._primary_url = os.getenv("JARVIS_TTS_URL", DEFAULT_TTS_URL).strip() or DEFAULT_TTS_URL
-        self._fallback_url = os.getenv("JARVIS_TTS_FALLBACK_URL", DEFAULT_TTS_URL).strip() or DEFAULT_TTS_URL
+        self._fallback_url = os.getenv("JARVIS_TTS_FALLBACK_URL", DEFAULT_TTS_FALLBACK_URL).strip() or DEFAULT_TTS_FALLBACK_URL
         self._active_url = self._primary_url
         self._last_status = "idle"
         self._last_warning: str | None = None
@@ -119,7 +120,11 @@ class KokoroTtsEngine:
         provider_header = response.headers.get("X-TTS-Provider")
         if provider_header:
             self._last_provider = provider_header
-        elif "host.docker.internal" in url:
+        elif (
+            "host.docker.internal:8870" in url
+            or "localhost:8870" in url
+            or "127.0.0.1:8870" in url
+        ):
             self._last_provider = "dml-host"
         else:
             self._last_provider = "cpu-service"

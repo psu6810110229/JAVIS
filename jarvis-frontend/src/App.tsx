@@ -25,6 +25,14 @@ type ChatMessage = {
   role: "system" | "user" | "assistant";
   label: string;
   content: string;
+  toolOutcome?: ToolOutcomeSummary;
+};
+
+type ToolOutcomeSummary = {
+  tool_name: string;
+  status: string;
+  verified: boolean | null;
+  evidence: string | null;
 };
 
 type AssistantAudioPayload = {
@@ -58,6 +66,10 @@ const EOF_RETRY_NUM_CTX = 512;
 function readPersistedPowerMode(): PowerMode {
   const persisted = window.localStorage.getItem(POWER_MODE_STORAGE_KEY);
   return persisted === "performance" ? "performance" : "eco";
+}
+
+function getModeDisplayLabel(mode: PowerMode): string {
+  return mode === "performance" ? "Deep" : "Quick";
 }
 
 function readPersistedVoiceAutoSpeak(): boolean {
@@ -103,6 +115,30 @@ function blobToBase64(blob: Blob): Promise<string> {
     };
     reader.readAsDataURL(blob);
   });
+}
+
+function parseToolOutcome(value: unknown): ToolOutcomeSummary | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const payload = value as Record<string, unknown>;
+  const toolName = typeof payload.tool_name === "string" ? payload.tool_name : "";
+  if (!toolName) {
+    return undefined;
+  }
+
+  const status = typeof payload.status === "string" ? payload.status : "unknown";
+  const verifiedRaw = payload.verified;
+  const verified = typeof verifiedRaw === "boolean" ? verifiedRaw : null;
+  const evidence = typeof payload.evidence === "string" ? payload.evidence : null;
+
+  return {
+    tool_name: toolName,
+    status,
+    verified,
+    evidence
+  };
 }
 
 function App() {
@@ -212,7 +248,12 @@ function App() {
 
       const gpuLoad = typeof systemLoad.GPU_Load === "number" ? systemLoad.GPU_Load : 0;
       const ramAvailableGb = typeof systemLoad.RAM_Available === "number" ? systemLoad.RAM_Available : 0;
-      const diskIoMBps = typeof systemLoad.Disk_IO === "number" ? systemLoad.Disk_IO : 0;
+      const diskIoMBps =
+        typeof systemLoad.Disk_IO_MBps === "number"
+          ? systemLoad.Disk_IO_MBps
+          : typeof systemLoad.Disk_IO === "number"
+            ? systemLoad.Disk_IO
+            : 0;
       const telemetrySource =
         typeof systemLoad.telemetry_source === "string" ? systemLoad.telemetry_source : "unavailable";
 
@@ -246,7 +287,7 @@ function App() {
     } catch (error: unknown) {
       if (!silentFailure) {
         setStatusLoadError(
-          error instanceof Error ? error.message : "Jarvis could not load the current power mode status."
+          error instanceof Error ? error.message : "Jarvis could not load the current model mode status."
         );
       }
     }
@@ -368,16 +409,56 @@ function App() {
     setMessages((current) => [...current, message]);
   }
 
+  function isToolCallPayloadText(content: string): boolean {
+    const trimmed = content.trim();
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+      return false;
+    }
+
+    try {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+      const declaredType = typeof parsed.t === "string" ? parsed.t : parsed.type;
+      const toolName =
+        typeof parsed.n === "string"
+          ? parsed.n
+          : typeof parsed.tool_name === "string"
+            ? parsed.tool_name
+            : typeof parsed.name === "string"
+              ? parsed.name
+              : "";
+      return (declaredType === "tool" || declaredType === undefined) && toolName.length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  function normalizeAssistantContent(content: string): string {
+    if (isToolCallPayloadText(content)) {
+      return "Processing command...";
+    }
+    return content;
+  }
+
   function updateMessageContent(messageId: string, content: string): void {
     setMessages((current) =>
-      current.map((message) => (message.id === messageId ? { ...message, content } : message))
+      current.map((message) =>
+        message.id === messageId ? { ...message, content: normalizeAssistantContent(content) } : message
+      )
+    );
+  }
+
+  function updateMessageToolOutcome(messageId: string, toolOutcome: ToolOutcomeSummary | undefined): void {
+    setMessages((current) =>
+      current.map((message) => (message.id === messageId ? { ...message, toolOutcome } : message))
     );
   }
 
   function appendMessageContent(messageId: string, delta: string): void {
     setMessages((current) =>
       current.map((message) =>
-        message.id === messageId ? { ...message, content: `${message.content}${delta}` } : message
+        message.id === messageId
+          ? { ...message, content: normalizeAssistantContent(`${message.content}${delta}`) }
+          : message
       )
     );
   }
@@ -439,11 +520,9 @@ function App() {
       pushMessage({
         id: `mode-switch-${Date.now()}`,
         role: "system",
-        label: "Power",
+        label: "Model",
         content:
-          typeof payload.message === "string"
-            ? payload.message
-            : `Switched to ${activeMode === "performance" ? "Performance" : "Eco"} mode.`
+          `Switched to ${getModeDisplayLabel(activeMode)} mode.`
       });
     } catch (error: unknown) {
       const message =
@@ -452,7 +531,7 @@ function App() {
       pushMessage({
         id: `mode-switch-error-${Date.now()}`,
         role: "system",
-        label: "Power",
+        label: "Model",
         content: message
       });
     } finally {
@@ -725,7 +804,7 @@ function App() {
     setPendingAssistantResponse(true);
     setIsTextStreaming(false);
     setAwaitingAssistantAudio(false);
-    setTransportNotice(currentMode === "performance" ? "Processing in Performance mode..." : "");
+    setTransportNotice(`Processing in ${getModeDisplayLabel(currentMode)} mode...`);
 
     try {
       const response = await fetch(`${apiBaseUrl}/v1/chat`, {
@@ -815,9 +894,11 @@ function App() {
 
           if (eventType === "final") {
             const finalText = typeof event.text === "string" ? event.text.trim() : "";
+            const toolOutcome = parseToolOutcome(event.last_tool_outcome);
             if (finalText.length > 0) {
               updateMessageContent(assistantMessageId, finalText);
             }
+            updateMessageToolOutcome(assistantMessageId, toolOutcome);
             setPendingAssistantResponse(false);
             setIsTextStreaming(false);
             if (!voiceAutoSpeak || (autoSpeakQueueRef.current.length === 0 && !autoSpeakPlayingRef.current)) {
@@ -827,10 +908,23 @@ function App() {
           }
 
           if (eventType === "error") {
-            streamErrorMessage =
+            const stage = typeof event.stage === "string" ? event.stage : "";
+            const message =
               typeof event.message === "string"
                 ? event.message
                 : "Jarvis encountered an unexpected streaming error.";
+
+            if (stage === "tts") {
+              pushMessage({
+                id: `tts-warning-${Date.now()}`,
+                role: "system",
+                label: "Voice",
+                content: message
+              });
+              continue;
+            }
+
+            streamErrorMessage = message;
             break;
           }
         }
@@ -1367,7 +1461,8 @@ function App() {
       id: assistantMessageId,
       role: "assistant",
       label: "Jarvis",
-      content: ""
+      content: "",
+      toolOutcome: undefined
     });
 
     clearAutoSpeakQueue();
@@ -1609,7 +1704,31 @@ function App() {
                   animate={{ opacity: 1, y: 0 }}
                   className="relative space-y-1"
                 >
-                  <p className="text-[11px] uppercase tracking-[0.18em] text-[#7d7d7d]">{message.label}</p>
+                  <div className="flex items-center gap-2">
+                    <p className="text-[11px] uppercase tracking-[0.18em] text-[#7d7d7d]">{message.label}</p>
+                    {message.role === "assistant" && message.toolOutcome ? (
+                      <span
+                        className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] ${
+                          message.toolOutcome.verified === true
+                            ? "bg-[#1f3a2a] text-[#a9f1c3]"
+                            : message.toolOutcome.verified === false
+                              ? "bg-[#3f2323] text-[#f6b3b3]"
+                              : "bg-[#2f2f2f] text-[#cfcfcf]"
+                        }`}
+                        title={
+                          message.toolOutcome.evidence
+                            ? `${message.toolOutcome.tool_name}: ${message.toolOutcome.evidence}`
+                            : `${message.toolOutcome.tool_name}: ${message.toolOutcome.status}`
+                        }
+                      >
+                        {message.toolOutcome.verified === true
+                          ? "verified"
+                          : message.toolOutcome.verified === false
+                            ? "unverified"
+                            : "reported"}
+                      </span>
+                    ) : null}
+                  </div>
                   <p
                     className={`whitespace-pre-wrap text-[15px] leading-7 ${
                       message.role === "user"

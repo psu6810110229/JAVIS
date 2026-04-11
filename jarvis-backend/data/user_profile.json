@@ -1,0 +1,11 @@
+{
+  "name": "Farn",
+  "response_style": "adaptive",
+  "command_priority": true,
+  "tone": "professional-human",
+  "goals": [
+    "automate my workflow"
+  ],
+  "likes": [],
+  "notes": []
+}

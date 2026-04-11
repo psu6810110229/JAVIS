@@ -36,7 +36,7 @@ Example:
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone as dt_timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -74,8 +74,11 @@ def get_current_datetime(timezone_name: str = "UTC") -> dict[str, str]:
     try:
         timezone = ZoneInfo(timezone_name)
     except ZoneInfoNotFoundError:
-        timezone = ZoneInfo("UTC")
         timezone_name = "UTC"
+        try:
+            timezone = ZoneInfo("UTC")
+        except ZoneInfoNotFoundError:
+            timezone = dt_timezone.utc
 
     now = datetime.now(timezone)
     return {

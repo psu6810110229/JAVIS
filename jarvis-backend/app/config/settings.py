@@ -43,22 +43,22 @@ class HardwareProfile:
     description: str = ""
 
 
-# Strict 1024 ctx for performance mode — the Memory Shield requirement.
-# E-Cores are excluded; we target only P-Cores (4 on i5-13420H) × 2 threads/core.
+# Both modes now run with strong CPU allocation.
+# Mode differences are model complexity, not power throttling.
 PERFORMANCE_PROFILE = HardwareProfile(
     mode="performance",
     num_ctx=1024,
     num_thread=8,   # All P-Cores on i5-13420H
     num_gpu=0,      # iGPU off by default; enabled by OLLAMA_INTEL_GPU=1
-    description="8B Typhoon model — full P-Core burst, 1K context window",
+    description="Deep reasoning model for complex tasks",
 )
 
 ECO_PROFILE = HardwareProfile(
     mode="eco",
     num_ctx=1536,   # Slightly larger ctx for the lighter 4B model
-    num_thread=2,   # Minimal CPU, leave headroom for UI/TTS
+    num_thread=8,   # Keep CPU performance high in quick mode as well
     num_gpu=0,
-    description="4B Typhoon model — low-power background mode",
+    description="Quick response model for everyday tasks",
 )
 
 FALLBACK_PROFILE = HardwareProfile(
@@ -79,8 +79,8 @@ PREWARM_PROFILE = HardwareProfile(
 
 # HTTP chat uses more threads because it is the primary user-facing path.
 HTTP_CHAT_NUM_THREAD: dict[str, int] = {
-    "performance": 8,
-    "eco": 4,
+    "performance": 10,
+    "eco": 10,
 }
 
 
@@ -88,7 +88,7 @@ HTTP_CHAT_NUM_THREAD: dict[str, int] = {
 # Tuning knobs
 # ---------------------------------------------------------------------------
 
-DEFAULT_OLLAMA_BASE_URL = "http://ollama:11434"
+DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_OLLAMA_TIMEOUT_SECONDS = 60.0
 DEFAULT_OLLAMA_PULL_TIMEOUT_SECONDS = 1800.0
 DEFAULT_OLLAMA_TEMPERATURE = 0.7
@@ -97,9 +97,9 @@ DEFAULT_KV_CACHE_TYPE = "q4_0"
 
 # Memory guardrails
 DEFAULT_LLM_MEMORY_CAP_BYTES = 8 * 1024 * 1024 * 1024      # 8 GB
-DEFAULT_LOW_RAM_FORCE_ECO_BYTES = 4 * 1024 * 1024 * 1024   # 4 GB available RAM floor
+DEFAULT_LOW_RAM_FORCE_ECO_BYTES = 2 * 1024 * 1024 * 1024   # 2 GB available RAM floor
 DEFAULT_HIGH_SWAP_FORCE_ECO_PERCENT = 35.0                  # Swap % above which eco is forced
-DEFAULT_PAGEFILE_GUARDRAIL_PERCENT = 10.0
+DEFAULT_PAGEFILE_GUARDRAIL_PERCENT = 85.0
 
 # Streaming/TTS pipeline
 DEFAULT_SENTENCE_TTS_CONCURRENCY = 2

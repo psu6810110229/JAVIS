@@ -17,8 +17,8 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TTS_URL = "http://kokoro:8880/v1/audio/speech"
-DEFAULT_TTS_FALLBACK_URL = "http://kokoro:8880/v1/audio/speech"
+DEFAULT_TTS_URL = "http://localhost:8870/v1/audio/speech"
+DEFAULT_TTS_FALLBACK_URL = "http://localhost:8880/v1/audio/speech"
 DEFAULT_TTS_MODE = "cpu-service"
 DEFAULT_TTS_SPEED = 1.2
 DEFAULT_TTS_TIMEOUT_SECONDS = 60.0

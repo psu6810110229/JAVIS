@@ -106,12 +106,24 @@ async def set_reminder(message: str, delay_seconds: int) -> dict[str, Any]:
         "Return real-time system information: CPU usage, RAM, disk space, "
         "battery level (if available), and uptime."
     ),
-    parameters={"type": "object", "properties": {}, "required": []},
+    parameters={
+        "type": "object",
+        "properties": {
+            "type": {
+                "type": "string",
+                "description": (
+                    "Optional metric selector: battery, cpu, ram, disk, uptime, or all. "
+                    "If omitted, returns full system summary."
+                ),
+            }
+        },
+        "required": [],
+    },
     risk_level="low",
     category="system",
     timeout_seconds=5,
 )
-async def get_system_info() -> dict[str, Any]:
+async def get_system_info(type: str | None = None) -> dict[str, Any]:
     """Collect live system metrics via psutil."""
     def _collect() -> dict[str, Any]:
         cpu_pct = psutil.cpu_percent(interval=0.5)
@@ -144,6 +156,46 @@ async def get_system_info() -> dict[str, Any]:
                 info["battery_plugged"] = bat.power_plugged
         except AttributeError:
             pass  # sensors_battery not available on this OS
+
+        requested = (type or "all").strip().lower()
+        if requested in {"all", "summary", "system", "system_info"}:
+            return info
+
+        if requested in {"battery", "power"}:
+            battery_percent = info.get("battery_percent")
+            battery_plugged = info.get("battery_plugged")
+            if battery_percent is None:
+                return {
+                    "battery_percent": None,
+                    "battery_plugged": None,
+                    "battery_status": "AC Power / No Battery Detected",
+                }
+            return {
+                "battery_percent": battery_percent,
+                "battery_plugged": battery_plugged,
+            }
+
+        if requested in {"cpu"}:
+            return {"cpu_percent": info["cpu_percent"]}
+
+        if requested in {"ram", "memory"}:
+            return {
+                "ram_total_gb": info["ram_total_gb"],
+                "ram_used_gb": info["ram_used_gb"],
+                "ram_available_gb": info["ram_available_gb"],
+                "ram_percent": info["ram_percent"],
+            }
+
+        if requested in {"disk", "storage"}:
+            return {
+                "disk_total_gb": info["disk_total_gb"],
+                "disk_used_gb": info["disk_used_gb"],
+                "disk_free_gb": info["disk_free_gb"],
+                "disk_percent": info["disk_percent"],
+            }
+
+        if requested in {"uptime"}:
+            return {"uptime": info["uptime"]}
 
         return info
 

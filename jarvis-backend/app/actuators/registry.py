@@ -26,8 +26,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
 import types
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from app.brain.models import ToolSchema
@@ -179,6 +181,23 @@ class ToolRegistry:
     # Execution
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _normalize_result(name: str, raw_result: Any, elapsed_ms: int) -> dict[str, Any]:
+        if isinstance(raw_result, dict):
+            normalized: dict[str, Any] = dict(raw_result)
+        else:
+            normalized = {"result": raw_result}
+
+        normalized.setdefault("status", "ok")
+        normalized.setdefault("verified", None)
+        normalized.setdefault("evidence", None)
+        normalized.setdefault("error", None)
+        normalized.setdefault("warning", None)
+        normalized["tool_name"] = name
+        normalized["elapsed_ms"] = elapsed_ms
+        normalized["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
+        return normalized
+
     async def execute(self, name: str, arguments: dict[str, Any]) -> Any:
         """Execute the named tool with the supplied *arguments* dict.
 
@@ -216,6 +235,7 @@ class ToolRegistry:
         logger.info("Executing tool '%s' with args: %s", name, arguments)
         metadata = self._metadata.get(name, {})
         timeout_seconds = metadata.get("timeout_seconds")
+        started = time.monotonic()
 
         try:
             if inspect.iscoroutinefunction(fn):
@@ -235,7 +255,8 @@ class ToolRegistry:
             logger.exception("Tool '%s' raised an exception: %s", name, error)
             raise
 
-        return result
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return self._normalize_result(name=name, raw_result=result, elapsed_ms=elapsed_ms)
 
 
 # ---------------------------------------------------------------------------
