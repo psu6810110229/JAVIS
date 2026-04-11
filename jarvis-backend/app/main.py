@@ -426,6 +426,28 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 )
                 continue
 
+            if envelope.type == "tool.confirm":
+                resolved = brain.risk_gate.resolve(session_id, approved=True)
+                await websocket.send_json(
+                    build_envelope(
+                        "tool.confirm.ack",
+                        {"resolved": resolved, "message": "Proceeding with the action."},
+                        session_id,
+                    )
+                )
+                continue
+
+            if envelope.type == "tool.deny":
+                resolved = brain.risk_gate.resolve(session_id, approved=False)
+                await websocket.send_json(
+                    build_envelope(
+                        "tool.deny.ack",
+                        {"resolved": resolved, "message": "Action cancelled by user."},
+                        session_id,
+                    )
+                )
+                continue
+
             if envelope.type == "session.end":
                 await websocket.send_json(
                     build_envelope("session.closed", {"message": "Jarvis session closed."}, session_id)

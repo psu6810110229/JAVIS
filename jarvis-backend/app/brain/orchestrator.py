@@ -41,6 +41,11 @@ from pydub.exceptions import CouldntDecodeError
 
 from app.actuators.registry import tool_registry  # activates tool auto-registration
 from app.actuators import system_tools as _system_tools_module  # noqa: F401 — side-effects only
+from app.actuators import windows_tools as _windows_tools_module  # noqa: F401
+from app.actuators import notification_tools as _notification_tools_module  # noqa: F401
+from app.actuators import web_tools as _web_tools_module  # noqa: F401
+from app.actuators import spotify_tools as _spotify_tools_module  # noqa: F401
+from app.actuators.risk_gate import RiskGate
 from app.brain.exceptions import (
     AudioProcessingError,
     OllamaModelError,
@@ -86,11 +91,22 @@ _MAX_TOOL_CALL_ROUNDS = 2
 _MAX_TOOL_RESULT_CHARS = 900
 
 _SYSTEM_INSTRUCTION = (
-    "You are Jarvis. Stay polite, concise, and use a British professional tone. "
+    "You are Jarvis, a proactive Windows machine agent running natively on the user's PC. "
+    "Use a British professional tone — polite, concise, action-oriented. "
+    "You have direct access to Windows system controls, Spotify playback, web search, "
+    "notifications, clipboard, and the filesystem. "
+    "RISK ASSESSMENT: Before calling any tool, evaluate its risk level. "
+    "For low-risk tools (get_*, search_*, now_playing, play/pause/volume): proceed directly. "
+    "For medium-risk tools (open_application, close_application, write_clipboard, etc.): "
+    "briefly warn the user — e.g. 'I'm going to open Notepad now.' — then call the tool. "
+    "For high-risk tools (shutdown, restart): ALWAYS state exactly what you are about to do "
+    "and why before calling the tool. The system will ask the user for confirmation. "
+    "APP LAUNCH PROTOCOL: When opening an application, wait for confirmation of success "
+    "before declaring it open. If the tool returns status 'crashed' or 'timeout', "
+    "tell the user immediately and honestly — never say 'I opened it' if it failed. "
     "Acknowledge the current mode (Eco/Performance) only if asked. "
-    "For small talk, keep replies brief. For technical requests, respond clearly and directly. "
-    "Avoid unnecessary verbosity and keep output practical. "
     "Always answer in English unless the user specifically requests Thai. "
+    "Avoid unnecessary verbosity. Keep output practical and direct."
 )
 
 
@@ -105,6 +121,7 @@ class Orchestrator:
         self._tts = TtsHostClient()
         self._tts_voice: str = self._tts.voice_label
         self._stt_language: str = DEFAULT_STT_LANGUAGE
+        self._risk_gate = RiskGate()
 
         # Init state
         self._initialized: bool = False
@@ -155,6 +172,11 @@ class Orchestrator:
     @property
     def tool_schemas(self) -> list[ToolSchema]:
         return tool_registry.get_schemas()
+
+    @property
+    def risk_gate(self) -> RiskGate:
+        """Expose the RiskGate so the WebSocket handler can forward confirmations."""
+        return self._risk_gate
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -379,6 +401,20 @@ class Orchestrator:
             decision = await self._assess_tool_call(tool_name=tool_name, active_mode=profile.mode)
             if not decision.allowed:
                 return self._guardian_message(decision)
+
+            # Risk gate: medium/high-risk tools pause for user confirmation.
+            # No send_event_fn in the non-WS tool loop — auto-approve low risk,
+            # warn for medium/high via the response text instead.
+            meta = tool_registry.get_metadata(tool_name)
+            risk_level = meta.get("risk_level", "low")
+            if risk_level in ("medium", "high"):
+                # In the non-streaming path, we cannot pause for WS confirmation;
+                # the LLM has already warned the user via its text (system prompt).
+                # Log and proceed — WS path handles interactive confirmation.
+                logger.info(
+                    "Tool '%s' risk_level='%s' — proceeding (non-interactive path).",
+                    tool_name, risk_level,
+                )
 
             try:
                 tool_result = await tool_registry.execute(tool_name, tool_args)

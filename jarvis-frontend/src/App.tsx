@@ -1,5 +1,5 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
-import { motion } from "framer-motion";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
 import PowerController from "./PowerController";
 
 type SocketStatus = "disconnected" | "connecting" | "connected";
@@ -10,6 +10,14 @@ type Envelope = {
   payload: Record<string, unknown>;
   timestamp?: string;
   session_id?: string;
+};
+
+type ConfirmationRequest = {
+  tool_name: string;
+  human_label: string;
+  risk_level: "medium" | "high";
+  message: string;
+  timeout_seconds: number;
 };
 
 type ChatMessage = {
@@ -121,6 +129,9 @@ function App() {
   const [statusLoadError, setStatusLoadError] = useState<string>("");
   const [prewarmWarning, setPrewarmWarning] = useState<string>("");
   const [pendingAssistantResponse, setPendingAssistantResponse] = useState<boolean>(false);
+  const [confirmationRequest, setConfirmationRequest] = useState<ConfirmationRequest | null>(null);
+  const [confirmCountdown, setConfirmCountdown] = useState<number>(30);
+  const confirmCountdownRef = useRef<number | null>(null);
   const [awaitingAssistantAudio, setAwaitingAssistantAudio] = useState<boolean>(false);
   const [isTextStreaming, setIsTextStreaming] = useState<boolean>(false);
   const [showVoiceControls, setShowVoiceControls] = useState<boolean>(false);
@@ -927,6 +938,40 @@ function App() {
         return;
       }
 
+      if (data.type === "confirmation_required") {
+        const p = data.payload as Partial<ConfirmationRequest>;
+        const timeout = typeof p.timeout_seconds === "number" ? p.timeout_seconds : 30;
+        setConfirmationRequest({
+          tool_name: typeof p.tool_name === "string" ? p.tool_name : "",
+          human_label: typeof p.human_label === "string" ? p.human_label : p.tool_name ?? "",
+          risk_level: p.risk_level === "high" ? "high" : "medium",
+          message: typeof p.message === "string" ? p.message : "Confirm this action?",
+          timeout_seconds: timeout,
+        });
+        setConfirmCountdown(timeout);
+        if (confirmCountdownRef.current !== null) {
+          window.clearInterval(confirmCountdownRef.current);
+        }
+        confirmCountdownRef.current = window.setInterval(() => {
+          setConfirmCountdown((prev) => {
+            if (prev <= 1) {
+              if (confirmCountdownRef.current !== null) {
+                window.clearInterval(confirmCountdownRef.current);
+                confirmCountdownRef.current = null;
+              }
+              setConfirmationRequest(null);
+              return 0;
+            }
+            return prev - 1;
+          });
+        }, 1000);
+        return;
+      }
+
+      if (data.type === "tool.confirm.ack" || data.type === "tool.deny.ack") {
+        return;
+      }
+
       if (data.type === "speech.transcript") {
         const transcriptText = typeof data.payload.text === "string" ? data.payload.text : "";
         if (transcriptText) {
@@ -1379,9 +1424,131 @@ function App() {
     });
   }
 
+  const sendConfirmation = useCallback((approved: boolean) => {
+    if (confirmCountdownRef.current !== null) {
+      window.clearInterval(confirmCountdownRef.current);
+      confirmCountdownRef.current = null;
+    }
+    setConfirmationRequest(null);
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(
+      JSON.stringify({
+        type: approved ? "tool.confirm" : "tool.deny",
+        payload: {},
+        session_id: sessionId,
+      } satisfies Envelope)
+    );
+  }, [sessionId]);
+
   return (
     <main className="minimal-root min-h-screen px-4 py-5 text-[#f5f5f5] sm:px-8">
       {currentMode === "performance" && pendingAssistantResponse && <div className="top-progress-bar" />}
+
+      {/* ── Risk Gate Confirmation Modal ───────────────────────────────── */}
+      <AnimatePresence>
+        {confirmationRequest && (
+          <motion.div
+            key="confirm-backdrop"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.18 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="confirm-title"
+          >
+            <motion.div
+              key="confirm-panel"
+              initial={{ opacity: 0, scale: 0.93, y: 16 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.93, y: 16 }}
+              transition={{ duration: 0.22, ease: "easeOut" }}
+              className="mx-4 w-full max-w-md rounded-2xl border border-[#2a2a2a] bg-[#111] shadow-2xl"
+            >
+              {/* Header */}
+              <div
+                className={`flex items-center gap-3 rounded-t-2xl px-5 py-4 ${
+                  confirmationRequest.risk_level === "high"
+                    ? "border-b border-red-900/40 bg-red-950/30"
+                    : "border-b border-amber-900/30 bg-amber-950/20"
+                }`}
+              >
+                <span
+                  className={`flex h-7 w-7 items-center justify-center rounded-full text-[14px] ${
+                    confirmationRequest.risk_level === "high"
+                      ? "bg-red-900/60 text-red-300"
+                      : "bg-amber-900/50 text-amber-300"
+                  }`}
+                  aria-hidden="true"
+                >
+                  {confirmationRequest.risk_level === "high" ? "⚠" : "!"}
+                </span>
+                <div className="flex-1">
+                  <p
+                    id="confirm-title"
+                    className="text-[13px] font-semibold uppercase tracking-widest text-[#d4d4d4]"
+                  >
+                    {confirmationRequest.risk_level === "high" ? "High-Risk Action" : "Confirm Action"}
+                  </p>
+                  <p className="mt-0.5 font-mono text-[11px] text-[#888]">
+                    {confirmationRequest.tool_name}
+                  </p>
+                </div>
+                <span
+                  className={`rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest ${
+                    confirmationRequest.risk_level === "high"
+                      ? "bg-red-900/50 text-red-400"
+                      : "bg-amber-900/40 text-amber-400"
+                  }`}
+                >
+                  {confirmationRequest.risk_level}
+                </span>
+              </div>
+
+              {/* Body */}
+              <div className="px-5 py-4">
+                <p className="text-[15px] font-medium text-[#e8e8e8]">
+                  {confirmationRequest.human_label}
+                </p>
+                <p className="mt-2 text-[13px] leading-6 text-[#999]">
+                  {confirmationRequest.message}
+                </p>
+              </div>
+
+              {/* Footer */}
+              <div className="flex items-center justify-between gap-3 rounded-b-2xl border-t border-[#222] px-5 py-3">
+                <p className="font-mono text-[11px] text-[#666]">
+                  Auto-cancels in {confirmCountdown}s
+                </p>
+                <div className="flex gap-3">
+                  <button
+                    id="confirm-deny-btn"
+                    type="button"
+                    onClick={() => sendConfirmation(false)}
+                    className="rounded-lg border border-[#333] bg-[#1a1a1a] px-4 py-2 text-[13px] text-[#b0b0b0] transition hover:border-[#555] hover:text-white"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    id="confirm-approve-btn"
+                    type="button"
+                    onClick={() => sendConfirmation(true)}
+                    className={`rounded-lg px-4 py-2 text-[13px] font-semibold text-white transition ${
+                      confirmationRequest.risk_level === "high"
+                        ? "bg-red-700 hover:bg-red-600"
+                        : "bg-amber-700 hover:bg-amber-600"
+                    }`}
+                  >
+                    Confirm
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
       <motion.section
         initial={{ opacity: 0, y: 24 }}
         animate={{ opacity: 1, y: 0 }}
