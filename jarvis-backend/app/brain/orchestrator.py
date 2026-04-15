@@ -29,10 +29,12 @@ import binascii
 import io
 import json
 import logging
+import os
 import re
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -47,13 +49,22 @@ from app.actuators import windows_tools as _windows_tools_module  # noqa: F401
 from app.actuators import notification_tools as _notification_tools_module  # noqa: F401
 from app.actuators import web_tools as _web_tools_module  # noqa: F401
 from app.actuators import spotify_tools as _spotify_tools_module  # noqa: F401
+from app.actuators import document_tools as _document_tools_module  # noqa: F401
 from app.actuators.risk_gate import RiskGate
+from app.brain.cloud_client import (
+    CloudClient,
+    CloudLLMError,
+    CloudLLMRateLimitError,
+    CloudLLMTimeoutError,
+    CloudLLMUnavailableError,
+)
 from app.brain.exceptions import (
     AudioProcessingError,
     OllamaModelError,
     OllamaResponseError,
     OllamaUnavailableError,
 )
+from app.brain.heuristic_router import HeuristicRouter, Route
 from app.brain.memory import SessionMemory
 from app.brain.memory_guardian import GuardianDecision, MemoryGuardian
 from app.brain.models import (
@@ -66,8 +77,11 @@ from app.brain.models import (
     VoiceInteractionResult,
 )
 from app.brain.ollama_client import OllamaClient
+from app.brain.plan_executor import PlanExecutor
 from app.brain.personal_profile import PersonalProfileStore
+from app.brain.spoken_display_policy import SpokenDisplayPolicy
 from app.brain.streamer import AsyncChunkStreamer
+from app.brain.tool_registry_bridge import SafeToolRegistry
 from app.config.settings import (
     DEFAULT_HIGH_SWAP_FORCE_ECO_PERCENT,
     DEFAULT_HOST_OPTIMIZER_TIMEOUT_SECONDS,
@@ -93,6 +107,25 @@ logger = logging.getLogger(__name__)
 _MAX_TOOL_CALL_ROUNDS = 2
 _MAX_TOOL_RESULT_CHARS = 900
 _VIRTUAL_SWITCH_MODE_TOOL = "__switch_jarvis_mode"
+
+_CLOUD_SYSTEM_PROMPT = (
+    "You are Jarvis, a professional AI assistant. "
+    "Respond in English only. Be concise, accurate, and practical."
+)
+
+_CLOUD_PLAN_PROMPT = (
+    "You are a task planner for a Windows AI assistant. "
+    "Convert the user's request into a JSON array of tool calls. "
+    "Respond ONLY with valid JSON array, no markdown or explanation. "
+    "Each element must be: {\"tool\": \"tool_name\", \"args\": {...}}. "
+    "Use only tools from the provided list. "
+    "Maximum 15 steps."
+)
+
+_CLOUD_SEARCH_SUMMARIZE_PROMPT = (
+    "You are Jarvis. Summarize provided web search results in 2-4 clear sentences. "
+    "Use only the provided results and suggest one follow-up question."
+)
 
 _SYSTEM_INSTRUCTION = (
     "You are Jarvis, a proactive Windows machine agent running natively on the user's PC. "
@@ -132,6 +165,42 @@ class Orchestrator:
         self._tts_voice: str = self._tts.voice_label
         self._stt_language: str = DEFAULT_STT_LANGUAGE
         self._risk_gate = RiskGate()
+
+        self._standby_tool_registry = SafeToolRegistry(
+            tool_registry,
+            allowed_tools=self._settings.standby_safe_tools,
+            policy_label="standby allowlist",
+        )
+        self._cloud_plan_tool_registry = SafeToolRegistry(
+            tool_registry,
+            allowed_tools=self._settings.cloud_planner_tools,
+            denied_tools=self._settings.cloud_planner_deny_tools,
+            policy_label="cloud planner allowlist",
+        )
+        self._plan_executor = PlanExecutor(self._cloud_plan_tool_registry)
+        self._spoken_display_policy = SpokenDisplayPolicy()
+
+        self._cloud_client: CloudClient | None = None
+        if self._settings.cloud_enabled:
+            try:
+                self._cloud_client = CloudClient(
+                    api_key=self._settings.cloud_api_key,
+                    base_url=self._settings.cloud_base_url,
+                    model=self._settings.cloud_model,
+                    timeout_seconds=self._settings.cloud_timeout_seconds,
+                )
+                logger.info(
+                    "Cloud LLM enabled: model=%s base_url=%s",
+                    self._settings.cloud_model,
+                    self._settings.cloud_base_url,
+                )
+            except Exception as err:  # noqa: BLE001
+                logger.warning("Cloud LLM init failed. Falling back to local-only: %s", err)
+                self._cloud_client = None
+        else:
+            logger.info("Cloud LLM disabled (missing API key or JARVIS_CLOUD_ENABLED=0).")
+
+        self._heuristic_router = HeuristicRouter(cloud_enabled=self._cloud_client is not None)
 
         # Init state
         self._initialized: bool = False
@@ -243,8 +312,10 @@ class Orchestrator:
             logger.warning("Startup diagnostics: failed to read TTS runtime status: %s", err)
 
     async def shutdown(self) -> None:
-        """Close Ollama connection pool gracefully."""
+        """Close Ollama and cloud connection pools gracefully."""
         await self._ollama.close()
+        if self._cloud_client is not None:
+            await self._cloud_client.close()
 
     # ------------------------------------------------------------------
     # Session management (delegated to SessionMemory)
@@ -394,6 +465,10 @@ class Orchestrator:
 
     def _deterministic_tool_fallback(self, user_text: str) -> tuple[str, dict[str, Any]] | None:
         normalized = user_text.lower().strip()
+        project_root = Path(__file__).resolve().parents[3]
+        explicit_root = os.getenv("JARVIS_PROJECT_ROOT", "").strip()
+        if explicit_root:
+            project_root = Path(explicit_root)
 
         if re.search(r"\b(switch|change|set)\b.*\b(deep|performance)\b(?:\s+mode)?\b", normalized):
             return _VIRTUAL_SWITCH_MODE_TOOL, {"mode": "performance"}
@@ -417,6 +492,60 @@ class Orchestrator:
             for alias, app_name in app_aliases.items():
                 if alias in normalized:
                     return "open_application", {"app_name": app_name}
+
+        if re.search(r"\b(set|change|adjust)\b.*\bvolume\b", normalized):
+            percent_match = re.search(r"(\d{1,3})\s*%?", normalized)
+            if percent_match:
+                return "set_system_volume", {"level": int(percent_match.group(1))}
+
+        if re.search(r"\b(mute|unmute)\b", normalized):
+            return "mute_toggle", {}
+
+        if re.search(r"\b(open)\b.*\b(file\s+explorer|explorer)\b", normalized):
+            to_path_match = re.search(r"\bto\s+([^\n]+)$", user_text.strip(), re.IGNORECASE)
+            if to_path_match:
+                raw_path = to_path_match.group(1).strip().strip("\"'")
+                if raw_path:
+                    return "open_path", {"path": raw_path}
+            return "open_application", {"app_name": "explorer"}
+
+        if re.search(r"\b(remind|reminder|notification|notify)\b", normalized):
+            seconds = 900
+            minute_match = re.search(r"(\d{1,3})\s*(minute|minutes|min)\b", normalized)
+            second_match = re.search(r"(\d{1,5})\s*(second|seconds|sec)\b", normalized)
+            hour_match = re.search(r"(\d{1,2})\s*(hour|hours|hr)\b", normalized)
+            if hour_match:
+                seconds = int(hour_match.group(1)) * 3600
+            elif minute_match:
+                seconds = int(minute_match.group(1)) * 60
+            elif second_match:
+                seconds = int(second_match.group(1))
+
+            message = user_text.strip()
+            quoted = re.search(r"['\"]([^'\"]+)['\"]", user_text)
+            if quoted:
+                message = quoted.group(1).strip()
+            message = re.sub(r"^.*?\b(remind(?:er)?|notify)\b\s*(?:me\s*)?(?:to\s*)?", "", message, flags=re.IGNORECASE).strip()
+            if not message:
+                message = "Reminder"
+            return "set_reminder", {"message": message, "delay_seconds": max(1, min(86400, seconds))}
+
+        if re.search(r"\b(search|find|list)\b.*\bpython\b.*\bfile", normalized) and re.search(r"\borchestrator\b", normalized):
+            return "search_file", {
+                "pattern": "*orchestrator*.py",
+                "search_root": str(project_root),
+                "max_results": 5,
+            }
+
+        if re.search(r"\b(search|find|list)\b.*\b(file|files|folder|folders|path|paths)\b", normalized):
+            pattern = "*"
+            if re.search(r"\bpython\b", normalized):
+                pattern = "*.py"
+            return "search_file", {
+                "pattern": pattern,
+                "search_root": str(project_root),
+                "max_results": 20,
+            }
 
         if re.search(r"\b(time|date|datetime)\b", normalized):
             timezone_name = self._infer_timezone_from_text(normalized)
@@ -639,6 +768,7 @@ class Orchestrator:
         status = str(tool_result.get("status") or "unknown").lower()
         verified = tool_result.get("verified")
         evidence = str(tool_result.get("evidence") or "No verification evidence.")
+        success_statuses = {"ok", "success", "done", "opened", "sent", "scheduled"}
 
         if tool_name == "get_current_datetime":
             timezone_name = str(tool_result.get("timezone") or "UTC")
@@ -671,13 +801,23 @@ class Orchestrator:
                 f"Status: {status}. Evidence: {evidence}"
             )
 
-        return f"I completed {tool_name}. Status: {status}."
+        if status in success_statuses and verified is not True:
+            return (
+                f"I sent the request for {tool_name}, but it is not verified yet. "
+                f"Status: {status}. Evidence: {evidence}"
+            )
+
+        if status in success_statuses and verified is True:
+            return f"I completed {tool_name}. Status: {status}."
+
+        return f"I attempted {tool_name}. Status: {status}. Evidence: {evidence}"
 
     @staticmethod
     def _enforce_claim_integrity(tool_name: str, tool_result: dict[str, Any], candidate_text: str) -> str:
         status = str(tool_result.get("status", "")).lower()
         verified = tool_result.get("verified")
         evidence = str(tool_result.get("evidence") or "No verification evidence.")
+        success_statuses = {"ok", "success", "done", "opened", "sent", "scheduled"}
 
         if tool_name == "switch_jarvis_mode" and status in {"ok", "success"}:
             return evidence
@@ -699,7 +839,26 @@ class Orchestrator:
                     f"Status: {status or 'unknown'}. Evidence: {evidence}"
                 )
 
+        if positive_claim and (status not in success_statuses or verified is not True):
+            return (
+                f"I sent the request for {tool_name}, but it is not verified as complete yet. "
+                f"Status: {status or 'unknown'}. Evidence: {evidence}"
+            )
+
         return candidate_text
+
+    @staticmethod
+    def _render_grounded_search_summary(search_query: str, results: list[dict[str, Any]]) -> str:
+        lines = [f"Here are grounded results for '{search_query}' from retrieved sources:"]
+        for index, item in enumerate(results[:5], 1):
+            title = str(item.get("title") or "Untitled result").strip()
+            snippet = re.sub(r"\s+", " ", str(item.get("snippet") or "")).strip()
+            url = str(item.get("url") or "").strip()
+            snippet_text = snippet if snippet else "No snippet was returned for this source."
+            source_text = f" Source: {url}" if url else ""
+            lines.append(f"{index}. {title} - {snippet_text}{source_text}")
+        lines.append("If you want, I can open one source and give a tighter summary.")
+        return "\n".join(lines)
 
     @staticmethod
     def _summarize_tool_outcome(tool_name: str | None, tool_result: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -711,6 +870,44 @@ class Orchestrator:
             "verified": tool_result.get("verified"),
             "evidence": tool_result.get("evidence"),
         }
+
+    @staticmethod
+    def _build_speech_policy_payload(
+        markers: set[str] | list[str],
+        *,
+        transformed_sentences: int,
+    ) -> dict[str, Any]:
+        marker_list = sorted(set(markers))
+        return {
+            "applied_markers": marker_list,
+            "marker_count": len(marker_list),
+            "transformed_sentences": int(transformed_sentences),
+        }
+
+    def _finalize_response_text(
+        self,
+        text: str,
+        *,
+        last_tool_name: str | None,
+        last_tool_result: dict[str, Any] | None,
+    ) -> str:
+        cleaned = self._spoken_display_policy.to_display_text(text)
+
+        # If a tool-call payload leaks into final text, replace with deterministic truthful text.
+        leaked_tool_payload = self._extract_tool_call(cleaned)
+        if leaked_tool_payload is not None:
+            if last_tool_name is not None and last_tool_result is not None:
+                return self._tool_only_fallback_text(last_tool_name, last_tool_result)
+            return "I processed your request, but I could not format a clear final response."
+
+        if cleaned.lower().startswith("processing command"):
+            if last_tool_name is not None and last_tool_result is not None:
+                return self._tool_only_fallback_text(last_tool_name, last_tool_result)
+
+        if last_tool_name is not None and last_tool_result is not None:
+            cleaned = self._enforce_claim_integrity(last_tool_name, last_tool_result, cleaned)
+
+        return cleaned
 
     async def _assess_tool_call(self, tool_name: str, active_mode: str) -> GuardianDecision:
         metadata = tool_registry.get_metadata(tool_name)
@@ -937,7 +1134,11 @@ class Orchestrator:
         ) -> None:
             return None
 
-        async def on_final_text_capture(final_text: str, _last_tool_outcome: dict[str, Any] | None) -> None:
+        async def on_final_text_capture(
+            final_text: str,
+            _last_tool_outcome: dict[str, Any] | None,
+            _speech_policy: dict[str, Any] | None,
+        ) -> None:
             final_text_from_callback["text"] = final_text
 
         try:
@@ -960,6 +1161,262 @@ class Orchestrator:
         return await self._attach_audio(BrainResponse(text=response_text, tool_schemas=self.tool_schemas))
 
     # ------------------------------------------------------------------
+    # Cloud handlers
+    # ------------------------------------------------------------------
+
+    async def _handle_cloud_reasoning(
+        self,
+        user_text: str,
+        session_id: str,
+        *,
+        on_text_chunk: Callable[[str], Awaitable[None]],
+        on_sentence_audio: Callable[[int, str, AssistantAudioPayload | None, str | None], Awaitable[None]],
+        on_final_text: Callable[[str, dict[str, Any] | None, dict[str, Any] | None], Awaitable[None]] | None = None,
+        auto_speak: bool = True,
+    ) -> str:
+        if self._cloud_client is None:
+            raise CloudLLMError("Cloud client not initialized.")
+
+        raw_messages = self._memory.get_messages(session_id) or []
+        recent = raw_messages[-6:]
+        messages: list[dict[str, str]] = [{"role": "system", "content": _CLOUD_SYSTEM_PROMPT}]
+        for item in recent:
+            role = item.get("role", "user")
+            content = item.get("content", "")
+            if role in {"user", "assistant"} and content.strip():
+                messages.append({"role": role, "content": content})
+
+        async def _on_delta(delta: str) -> None:
+            await on_text_chunk(delta)
+
+        cloud_response = await self._cloud_client.chat_streaming(
+            messages,
+            temperature=0.3,
+            max_tokens=1024,
+            on_delta=_on_delta,
+        )
+        final_text = cloud_response.text.strip() or "I couldn't generate a response."
+        final_text = self._spoken_display_policy.to_display_text(final_text)
+        spoken_text, markers = self._spoken_display_policy.to_spoken_with_meta(final_text)
+        speech_policy = self._build_speech_policy_payload(markers, transformed_sentences=1)
+
+        if auto_speak and spoken_text:
+            try:
+                audio_payload, spoken_used = await self._synthesize_audio_resilient(spoken_text)
+                await on_sentence_audio(0, spoken_used, audio_payload, None)
+            except AudioProcessingError as err:
+                await on_sentence_audio(0, spoken_text, None, str(err))
+
+        if on_final_text is not None:
+            await on_final_text(final_text, None, speech_policy)
+
+        return final_text
+
+    async def _handle_cloud_search(
+        self,
+        user_text: str,
+        search_query: str,
+        *,
+        on_text_chunk: Callable[[str], Awaitable[None]],
+        on_sentence_audio: Callable[[int, str, AssistantAudioPayload | None, str | None], Awaitable[None]],
+        on_final_text: Callable[[str, dict[str, Any] | None, dict[str, Any] | None], Awaitable[None]] | None = None,
+        auto_speak: bool = True,
+    ) -> str:
+        if self._cloud_client is None:
+            raise CloudLLMError("Cloud client not initialized.")
+
+        try:
+            search_result = await self._cloud_plan_tool_registry.execute(
+                "search_web", {"query": search_query, "max_results": 5}
+            )
+        except Exception as err:  # noqa: BLE001
+            search_result = {"status": "error", "error": str(err), "results": []}
+
+        results = search_result.get("results", [])
+        search_diagnostics: list[str] = []
+        search_error = str(search_result.get("error", "")).strip()
+        if search_error:
+            search_diagnostics.append(f"search_web: {search_error}")
+
+        if not results:
+            try:
+                news_result = await self._cloud_plan_tool_registry.execute(
+                    "search_news", {"query": search_query, "max_results": 5}
+                )
+                news_results = news_result.get("results", [])
+                if news_results:
+                    results = [
+                        {
+                            "title": item.get("title", ""),
+                            "url": item.get("url", ""),
+                            "snippet": item.get("snippet", ""),
+                        }
+                        for item in news_results
+                    ]
+                else:
+                    news_error = str(news_result.get("error", "")).strip()
+                    if news_error:
+                        search_diagnostics.append(f"search_news: {news_error}")
+            except Exception as err:  # noqa: BLE001
+                search_diagnostics.append(f"search_news: {err}")
+
+        if not results:
+            try:
+                instant = await self._cloud_plan_tool_registry.execute(
+                    "instant_answer", {"query": search_query}
+                )
+                if instant.get("found"):
+                    results = [
+                        {
+                            "title": f"Instant answer: {search_query}",
+                            "url": instant.get("url", ""),
+                            "snippet": instant.get("answer", ""),
+                        }
+                    ]
+                else:
+                    instant_error = str(instant.get("error", "")).strip()
+                    if instant_error:
+                        search_diagnostics.append(f"instant_answer: {instant_error}")
+            except Exception as err:  # noqa: BLE001
+                search_diagnostics.append(f"instant_answer: {err}")
+
+        if not results:
+            detail = f" Diagnostics: {' | '.join(search_diagnostics)}" if search_diagnostics else ""
+            fallback = f"I searched for '{search_query}' but found no results.{detail}"
+            fallback = self._spoken_display_policy.to_display_text(fallback)
+            await on_text_chunk(fallback)
+            spoken_fallback, markers = self._spoken_display_policy.to_spoken_with_meta(fallback)
+            speech_policy = self._build_speech_policy_payload(markers, transformed_sentences=1)
+            if auto_speak:
+                try:
+                    audio_payload, spoken_used = await self._synthesize_audio_resilient(spoken_fallback)
+                    await on_sentence_audio(0, spoken_used, audio_payload, None)
+                except AudioProcessingError as err:
+                    await on_sentence_audio(0, spoken_fallback, None, str(err))
+            if on_final_text is not None:
+                await on_final_text(fallback, search_result, speech_policy)
+            return fallback
+
+        context_lines: list[str] = []
+        for index, item in enumerate(results[:5], 1):
+            title = item.get("title", "")
+            snippet = item.get("snippet", "")
+            url = item.get("url", "")
+            context_lines.append(f"{index}. {title}\n   {snippet}\n   URL: {url}")
+        search_context = "\n\n".join(context_lines)
+
+        _ = user_text
+        _ = search_context
+        final_text = self._render_grounded_search_summary(search_query, results)
+        await on_text_chunk(final_text)
+        final_text = self._spoken_display_policy.to_display_text(final_text)
+
+        speech_text, markers = self._spoken_display_policy.to_spoken_with_meta(final_text)
+        if auto_speak and final_text:
+            try:
+                audio_payload, spoken_used = await self._synthesize_audio_resilient(speech_text)
+                await on_sentence_audio(0, spoken_used, audio_payload, None)
+            except AudioProcessingError as err:
+                await on_sentence_audio(0, speech_text, None, str(err))
+
+        speech_policy = self._build_speech_policy_payload(markers, transformed_sentences=1)
+
+        tool_outcome = {
+            "tool_name": "search_web",
+            "status": "ok",
+            "verified": True,
+            "evidence": f"Found {len(results)} results for '{search_query}'.",
+            "results": results,
+        }
+        if on_final_text is not None:
+            await on_final_text(final_text, tool_outcome, speech_policy)
+        return final_text
+
+    async def _handle_cloud_multistep(
+        self,
+        user_text: str,
+        *,
+        on_text_chunk: Callable[[str], Awaitable[None]],
+        on_sentence_audio: Callable[[int, str, AssistantAudioPayload | None, str | None], Awaitable[None]],
+        on_final_text: Callable[[str, dict[str, Any] | None, dict[str, Any] | None], Awaitable[None]] | None = None,
+        auto_speak: bool = True,
+    ) -> str:
+        if self._cloud_client is None:
+            raise CloudLLMError("Cloud client not initialized.")
+
+        allowed_tools = self._plan_executor._allowed
+        tool_lines: list[str] = []
+        for schema in self.tool_schemas:
+            if schema.name not in allowed_tools:
+                continue
+            params = schema.parameters or {}
+            props = params.get("properties", {})
+            required = params.get("required", [])
+            args_desc = ", ".join(
+                f"{key}({'required' if key in required else 'optional'})"
+                for key in props
+            )
+            tool_lines.append(f"- {schema.name}: {schema.description or ''}. Args: {{{args_desc}}}")
+        tools_schema_str = "\n".join(tool_lines) if tool_lines else ", ".join(sorted(allowed_tools))
+
+        messages: list[dict[str, str]] = [
+            {
+                "role": "system",
+                "content": _CLOUD_PLAN_PROMPT + f"\n\nAvailable tools:\n{tools_schema_str}",
+            },
+            {"role": "user", "content": user_text},
+        ]
+
+        plan_data = await self._cloud_client.chat_json(
+            messages,
+            temperature=0.1,
+            max_tokens=1024,
+        )
+
+        if isinstance(plan_data, list):
+            raw_plan = plan_data
+        elif isinstance(plan_data, dict):
+            raw_plan = plan_data.get("steps", plan_data.get("plan", []))
+        else:
+            raise CloudLLMError(f"Unexpected plan format: {type(plan_data)}")
+
+        if not raw_plan:
+            raise CloudLLMError("Cloud returned an empty plan.")
+
+        try:
+            validated_steps = self._plan_executor.validate_plan(raw_plan)
+        except ValueError as err:
+            raise CloudLLMError(f"Plan validation failed: {err}") from err
+
+        plan_result = await self._plan_executor.execute(validated_steps)
+        final_text = self._spoken_display_policy.to_display_text(plan_result.summary)
+        await on_text_chunk(final_text)
+
+        if auto_speak and final_text:
+            speech_text, markers = self._spoken_display_policy.to_spoken_with_meta(final_text)
+            try:
+                audio_payload, spoken_used = await self._synthesize_audio_resilient(speech_text)
+                await on_sentence_audio(0, spoken_used, audio_payload, None)
+            except AudioProcessingError as err:
+                await on_sentence_audio(0, speech_text, None, str(err))
+        else:
+            _speech_preview, markers = self._spoken_display_policy.to_spoken_with_meta(final_text)
+
+        speech_policy = self._build_speech_policy_payload(markers, transformed_sentences=1)
+
+        tool_outcome = {
+            "tool_name": "cloud_multistep",
+            "status": "ok" if plan_result.success else "error",
+            "verified": plan_result.success,
+            "evidence": plan_result.summary,
+            "plan_result": plan_result.to_dict(),
+        }
+        if on_final_text is not None:
+            await on_final_text(final_text, tool_outcome, speech_policy)
+
+        return final_text
+
+    # ------------------------------------------------------------------
     # HTTP chat streaming (NDJSON) — primary UI path
     # ------------------------------------------------------------------
 
@@ -971,7 +1428,7 @@ class Orchestrator:
         num_ctx_override: int | None,
         on_text_chunk: Callable[[str], Awaitable[None]],
         on_sentence_audio: Callable[[int, str, AssistantAudioPayload | None, str | None], Awaitable[None]],
-        on_final_text: Callable[[str, dict[str, Any] | None], Awaitable[None]] | None = None,
+        on_final_text: Callable[[str, dict[str, Any] | None, dict[str, Any] | None], Awaitable[None]] | None = None,
     ) -> str:
         if not user_text.strip():
             raise RuntimeError("I did not receive any text to process.")
@@ -983,10 +1440,21 @@ class Orchestrator:
         tts_synthesize = self._synthesize_audio_raw if auto_speak else None
         tts_callback = on_sentence_audio if auto_speak else None
 
+        speech_markers: set[str] = set()
+        transformed_sentences = 0
+
+        def _speech_transform(text: str) -> str:
+            nonlocal transformed_sentences
+            spoken, markers = self._spoken_display_policy.to_spoken_with_meta(text)
+            speech_markers.update(markers)
+            transformed_sentences += 1
+            return spoken
+
         streamer = AsyncChunkStreamer(
             tts_synthesize=tts_synthesize,
             on_text_chunk=on_text_chunk,
             on_sentence_audio=tts_callback,
+            speech_transform=_speech_transform,
             max_tts_concurrency=DEFAULT_SENTENCE_TTS_CONCURRENCY,
             flush_interval_seconds=DEFAULT_STREAM_TEXT_FLUSH_SECONDS,
             flush_min_chars=DEFAULT_STREAM_TEXT_FLUSH_MIN_CHARS,
@@ -1015,6 +1483,49 @@ class Orchestrator:
                     user_text,
                     strict_command_mode=strict_command_mode,
                 )
+
+                cloud_enabled = bool(self._settings.cloud_enabled and self._cloud_client is not None)
+                route_decision = self._heuristic_router.classify(user_text)
+                if cloud_enabled and route_decision.route in {Route.CLOUD_REASONING, Route.CLOUD_SEARCH, Route.CLOUD_MULTISTEP}:
+                    try:
+                        if route_decision.route == Route.CLOUD_REASONING:
+                            final_text = await self._handle_cloud_reasoning(
+                                user_text,
+                                session_id,
+                                on_text_chunk=on_text_chunk,
+                                on_sentence_audio=on_sentence_audio,
+                                on_final_text=on_final_text,
+                                auto_speak=auto_speak,
+                            )
+                        elif route_decision.route == Route.CLOUD_SEARCH:
+                            final_text = await self._handle_cloud_search(
+                                user_text,
+                                route_decision.extracted_query or user_text,
+                                on_text_chunk=on_text_chunk,
+                                on_sentence_audio=on_sentence_audio,
+                                on_final_text=on_final_text,
+                                auto_speak=auto_speak,
+                            )
+                        else:
+                            final_text = await self._handle_cloud_multistep(
+                                user_text,
+                                on_text_chunk=on_text_chunk,
+                                on_sentence_audio=on_sentence_audio,
+                                on_final_text=on_final_text,
+                                auto_speak=auto_speak,
+                            )
+
+                        self._memory.append_assistant(session_id, final_text)
+                        self._ollama_available = True
+                        self._initialization_error = None
+                        return final_text
+                    except (CloudLLMError, CloudLLMTimeoutError, CloudLLMRateLimitError, CloudLLMUnavailableError) as err:
+                        logger.warning(
+                            "[HTTP streaming] Cloud route '%s' failed; falling back to local: %s",
+                            route_decision.route.value,
+                            err,
+                        )
+
                 pending_tool_call = self._deterministic_tool_fallback(user_text)
                 if pending_tool_call is not None:
                     logger.info(
@@ -1235,14 +1746,23 @@ class Orchestrator:
                         raise
                     working_messages.append({"role": "assistant", "content": final_text})
 
+                final_text = self._finalize_response_text(
+                    final_text,
+                    last_tool_name=last_tool_name,
+                    last_tool_result=last_tool_result,
+                )
                 self._memory.append_assistant(session_id, final_text)
                 self._ollama_available = True
                 self._initialization_error = None
                 final_tool_outcome = self._summarize_tool_outcome(last_tool_name, last_tool_result)
+                speech_policy = self._build_speech_policy_payload(
+                    speech_markers,
+                    transformed_sentences=transformed_sentences,
+                )
 
                 if on_final_text is not None:
                     try:
-                        await on_final_text(final_text, final_tool_outcome)
+                        await on_final_text(final_text, final_tool_outcome, speech_policy)
                     except RuntimeError as err:
                         logger.warning("Final text callback failed: %s", err)
 
@@ -1307,6 +1827,42 @@ class Orchestrator:
     async def _synthesize_audio_raw(self, text: str) -> AssistantAudioPayload:
         """TTS wrapper injected into AsyncChunkStreamer (same signature)."""
         return await self._synthesize_audio(text)
+
+    @staticmethod
+    def _tts_retry_candidates(text: str) -> list[str]:
+        base = (text or "").strip()
+        if not base:
+            return ["Done."]
+
+        candidates: list[str] = [base]
+
+        boundary = re.search(r"[.!?]\s", base)
+        if boundary is not None:
+            first_sentence = base[: boundary.end()].strip()
+            if first_sentence and first_sentence not in candidates:
+                candidates.append(first_sentence)
+
+        for limit in (240, 180, 120):
+            shortened = base[:limit].strip()
+            if shortened and shortened not in candidates:
+                candidates.append(shortened)
+
+        if "Here is your summary." not in candidates:
+            candidates.append("Here is your summary.")
+
+        return candidates
+
+    async def _synthesize_audio_resilient(self, text: str) -> tuple[AssistantAudioPayload, str]:
+        last_error: AudioProcessingError | None = None
+        for candidate in self._tts_retry_candidates(text):
+            try:
+                payload = await self._synthesize_audio(candidate)
+                return payload, candidate
+            except AudioProcessingError as err:
+                last_error = err
+                logger.warning("TTS retry candidate failed (chars=%d): %s", len(candidate), err)
+
+        raise last_error or AudioProcessingError("Jarvis could not synthesize assistant audio.")
 
     async def _attach_audio(self, response: BrainResponse) -> BrainResponse:
         try:

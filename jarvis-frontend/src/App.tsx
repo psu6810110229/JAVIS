@@ -26,6 +26,7 @@ type ChatMessage = {
   label: string;
   content: string;
   toolOutcome?: ToolOutcomeSummary;
+  speechPolicyMarkers?: string[];
 };
 
 type ToolOutcomeSummary = {
@@ -33,6 +34,12 @@ type ToolOutcomeSummary = {
   status: string;
   verified: boolean | null;
   evidence: string | null;
+};
+
+type SpeechPolicySummary = {
+  applied_markers: string[];
+  marker_count: number;
+  transformed_sentences: number;
 };
 
 type AssistantAudioPayload = {
@@ -58,6 +65,7 @@ const DEFAULT_WS_URL = "ws://127.0.0.1:8000/ws";
 const DEFAULT_API_URL = "http://127.0.0.1:8000";
 const POWER_MODE_STORAGE_KEY = "jarvis.power.mode";
 const VOICE_AUTO_SPEAK_STORAGE_KEY = "jarvis.voice.auto_speak";
+const DEBUG_PANEL_STORAGE_KEY = "jarvis.debug.panel";
 const PTT_HOTKEY = "Alt";
 const TURBO_MODE_THRESHOLD = 95;
 const EOF_RETRY_DELAY_MS = 500;
@@ -79,6 +87,15 @@ function readPersistedVoiceAutoSpeak(): boolean {
   }
 
   return persisted !== "off";
+}
+
+function readPersistedDebugPanelEnabled(): boolean {
+  const persisted = window.localStorage.getItem(DEBUG_PANEL_STORAGE_KEY);
+  if (persisted === null) {
+    return false;
+  }
+
+  return persisted === "on";
 }
 
 function base64ToBlob(base64: string, mimeType: string): Blob {
@@ -141,6 +158,28 @@ function parseToolOutcome(value: unknown): ToolOutcomeSummary | undefined {
   };
 }
 
+function parseSpeechPolicy(value: unknown): SpeechPolicySummary | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const payload = value as Record<string, unknown>;
+  const appliedRaw = payload.applied_markers;
+  const appliedMarkers = Array.isArray(appliedRaw)
+    ? appliedRaw.filter((item): item is string => typeof item === "string" && item.length > 0)
+    : [];
+
+  const markerCount = typeof payload.marker_count === "number" ? payload.marker_count : appliedMarkers.length;
+  const transformedSentences =
+    typeof payload.transformed_sentences === "number" ? payload.transformed_sentences : 0;
+
+  return {
+    applied_markers: appliedMarkers,
+    marker_count: markerCount,
+    transformed_sentences: transformedSentences
+  };
+}
+
 function App() {
   const [socketStatus, setSocketStatus] = useState<SocketStatus>("disconnected");
   const [messages, setMessages] = useState<ChatMessage[]>([
@@ -159,6 +198,7 @@ function App() {
   const [audioUiError, setAudioUiError] = useState<string>("");
   const [sttUiError, setSttUiError] = useState<string>("");
   const [voiceAutoSpeak, setVoiceAutoSpeak] = useState<boolean>(() => readPersistedVoiceAutoSpeak());
+  const [debugPanelEnabled, setDebugPanelEnabled] = useState<boolean>(() => readPersistedDebugPanelEnabled());
   const [currentMode, setCurrentMode] = useState<PowerMode>(() => readPersistedPowerMode());
   const [activeModel, setActiveModel] = useState<string>("");
   const [isSwitchingMode, setIsSwitchingMode] = useState<boolean>(false);
@@ -453,6 +493,16 @@ function App() {
     );
   }
 
+  function updateMessageSpeechPolicyMarkers(messageId: string, speechPolicy: SpeechPolicySummary | undefined): void {
+    setMessages((current) =>
+      current.map((message) =>
+        message.id === messageId
+          ? { ...message, speechPolicyMarkers: speechPolicy?.applied_markers ?? [] }
+          : message
+      )
+    );
+  }
+
   function appendMessageContent(messageId: string, delta: string): void {
     setMessages((current) =>
       current.map((message) =>
@@ -469,6 +519,10 @@ function App() {
 
   function persistVoiceAutoSpeak(enabled: boolean): void {
     window.localStorage.setItem(VOICE_AUTO_SPEAK_STORAGE_KEY, enabled ? "on" : "off");
+  }
+
+  function persistDebugPanelEnabled(enabled: boolean): void {
+    window.localStorage.setItem(DEBUG_PANEL_STORAGE_KEY, enabled ? "on" : "off");
   }
 
   function clearModelContextTimeout(): void {
@@ -895,10 +949,12 @@ function App() {
           if (eventType === "final") {
             const finalText = typeof event.text === "string" ? event.text.trim() : "";
             const toolOutcome = parseToolOutcome(event.last_tool_outcome);
+            const speechPolicy = parseSpeechPolicy(event.speech_policy);
             if (finalText.length > 0) {
               updateMessageContent(assistantMessageId, finalText);
             }
             updateMessageToolOutcome(assistantMessageId, toolOutcome);
+            updateMessageSpeechPolicyMarkers(assistantMessageId, speechPolicy);
             setPendingAssistantResponse(false);
             setIsTextStreaming(false);
             if (!voiceAutoSpeak || (autoSpeakQueueRef.current.length === 0 && !autoSpeakPlayingRef.current)) {
@@ -1740,6 +1796,12 @@ function App() {
                   >
                     {message.content}
                   </p>
+                  {debugPanelEnabled && message.role === "assistant" && message.speechPolicyMarkers && message.speechPolicyMarkers.length > 0 ? (
+                    <div className="rounded border border-[#2a2a2a] bg-[#161616] px-2 py-1 text-[10px] font-mono text-[#8f8f8f]">
+                      <span className="mr-1 text-[#a7a7a7]">speech_policy:</span>
+                      <span>{message.speechPolicyMarkers.join(", ")}</span>
+                    </div>
+                  ) : null}
                   {message.role === "assistant" && message.content.trim().length > 0 ? (
                     <button
                       type="button"
@@ -1810,6 +1872,17 @@ function App() {
                 className="text-[12px] text-[#9ea9b7] transition hover:text-[#d8e2f0]"
               >
                 {voiceAutoSpeak ? "VOICE: ON" : "VOICE: OFF"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const next = !debugPanelEnabled;
+                  setDebugPanelEnabled(next);
+                  persistDebugPanelEnabled(next);
+                }}
+                className="text-[12px] text-[#9ea9b7] transition hover:text-[#d8e2f0]"
+              >
+                {debugPanelEnabled ? "DEBUG: ON" : "DEBUG: OFF"}
               </button>
               <button
                 type="submit"

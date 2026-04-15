@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 from app.actuators.registry import tool
@@ -20,6 +21,23 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_RESULTS = 5
 _MAX_RESULTS_HARD_CAP = 10
+_TEXT_BACKENDS = ("auto", "html", "lite")
+
+
+def _normalize_query(raw_query: str) -> str:
+    query = (raw_query or "").strip()
+    if (query.startswith("\"") and query.endswith("\"")) or (query.startswith("'") and query.endswith("'")):
+        query = query[1:-1].strip()
+    query = re.sub(r"\s+", " ", query).strip()
+    return query
+
+
+def _map_text_hit(hit: dict[str, Any]) -> dict[str, str]:
+    return {
+        "title": str(hit.get("title", "")),
+        "url": str(hit.get("href", hit.get("url", ""))),
+        "snippet": str(hit.get("body", hit.get("snippet", ""))),
+    }
 
 
 # ── search_web ────────────────────────────────────────────────────────────────
@@ -51,28 +69,47 @@ _MAX_RESULTS_HARD_CAP = 10
 )
 async def search_web(query: str, max_results: int = _DEFAULT_MAX_RESULTS) -> dict[str, Any]:
     """Perform a DuckDuckGo web search and return structured results."""
+    query = _normalize_query(query)
+    if not query:
+        return {"query": query, "results": [], "count": 0, "error": "empty_query"}
+
     n = max(1, min(_MAX_RESULTS_HARD_CAP, max_results))
 
-    def _search() -> list[dict[str, str]]:
+    def _search() -> tuple[list[dict[str, str]], str, list[str]]:
         from duckduckgo_search import DDGS  # type: ignore[import]
 
-        results: list[dict[str, str]] = []
-        with DDGS() as ddgs:
-            for hit in ddgs.text(query, max_results=n):
-                results.append({
-                    "title": hit.get("title", ""),
-                    "url": hit.get("href", ""),
-                    "snippet": hit.get("body", ""),
-                })
-        return results
+        errors: list[str] = []
+        for backend in _TEXT_BACKENDS:
+            try:
+                with DDGS() as ddgs:
+                    hits = ddgs.text(query, backend=backend, max_results=n)
+                results = [_map_text_hit(hit) for hit in hits if isinstance(hit, dict)]
+                # Some environments can return empty from one backend and work on another.
+                if results:
+                    return results, backend, errors
+                errors.append(f"{backend}:empty")
+            except Exception as err:  # noqa: BLE001
+                errors.append(f"{backend}:{err}")
+
+        return [], "none", errors
 
     try:
-        results = await asyncio.to_thread(_search)
+        results, backend_used, backend_errors = await asyncio.to_thread(_search)
     except Exception as err:  # noqa: BLE001
         logger.warning("DuckDuckGo web search failed: %s", err)
         return {"query": query, "results": [], "error": str(err)}
 
-    return {"query": query, "results": results, "count": len(results)}
+    response: dict[str, Any] = {
+        "query": query,
+        "results": results,
+        "count": len(results),
+        "backend": backend_used,
+    }
+    if backend_errors and not results:
+        response["error"] = "; ".join(backend_errors)
+    elif backend_errors:
+        response["warning"] = "; ".join(backend_errors)
+    return response
 
 
 # ── search_news ───────────────────────────────────────────────────────────────
@@ -103,6 +140,10 @@ async def search_web(query: str, max_results: int = _DEFAULT_MAX_RESULTS) -> dic
 )
 async def search_news(query: str, max_results: int = _DEFAULT_MAX_RESULTS) -> dict[str, Any]:
     """Search DuckDuckGo News for recent headlines."""
+    query = _normalize_query(query)
+    if not query:
+        return {"query": query, "results": [], "count": 0, "error": "empty_query"}
+
     n = max(1, min(_MAX_RESULTS_HARD_CAP, max_results))
 
     def _search() -> list[dict[str, str]]:
@@ -153,6 +194,10 @@ async def search_news(query: str, max_results: int = _DEFAULT_MAX_RESULTS) -> di
 )
 async def instant_answer(query: str) -> dict[str, Any]:
     """Fetch a DuckDuckGo instant answer."""
+    query = _normalize_query(query)
+    if not query:
+        return {"query": query, "answer": None, "found": False, "error": "empty_query"}
+
     def _fetch() -> dict[str, Any]:
         from duckduckgo_search import DDGS  # type: ignore[import]
 

@@ -62,6 +62,7 @@ class AsyncChunkStreamer:
         tts_synthesize: Callable[[str], Awaitable[Any]] | None,
         on_text_chunk: Callable[[str], Awaitable[None]],
         on_sentence_audio: Callable[[int, str, Any | None, str | None], Awaitable[None]] | None,
+        speech_transform: Callable[[str], str] | None = None,
         max_tts_concurrency: int = 2,
         flush_interval_seconds: float = 0.10,
         flush_min_chars: int = 64,
@@ -69,6 +70,7 @@ class AsyncChunkStreamer:
         self._tts_synthesize = tts_synthesize
         self._on_text_chunk = on_text_chunk
         self._on_sentence_audio = on_sentence_audio
+        self._speech_transform = speech_transform
         self._flush_interval = flush_interval_seconds
         self._flush_min_chars = flush_min_chars
 
@@ -149,6 +151,11 @@ class AsyncChunkStreamer:
 
     def _dispatch_tts(self, sentence_text: str) -> None:
         """Spawn a non-blocking TTS synthesis task for *sentence_text*."""
+        if self._speech_transform is not None:
+            sentence_text = self._speech_transform(sentence_text)
+        if not sentence_text.strip():
+            return
+
         idx = self._sentence_index
         self._sentence_index += 1
         task = asyncio.create_task(

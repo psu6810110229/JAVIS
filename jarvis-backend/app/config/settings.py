@@ -116,6 +116,30 @@ DEFAULT_HOST_OPTIMIZER_TIMEOUT_SECONDS = 0.35
 # STT
 DEFAULT_STT_LANGUAGE = "th-TH"
 
+# Cloud LLM (Groq)
+DEFAULT_CLOUD_API_KEY = ""
+DEFAULT_CLOUD_BASE_URL = "https://api.groq.com/openai/v1"
+DEFAULT_CLOUD_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_CLOUD_TIMEOUT_SECONDS = 15.0
+DEFAULT_CLOUD_ENABLED = True
+
+# Standby safe tools (legacy/local path)
+DEFAULT_STANDBY_SAFE_TOOLS = (
+    "open_application,set_system_volume,get_system_volume,mute_toggle,"
+    "search_web,search_news,instant_answer"
+)
+
+# Cloud planner tools (separate from standby safe tools)
+# Keep destructive operations out by default and enforce with denylist as well.
+DEFAULT_CLOUD_PLANNER_TOOLS = (
+    "open_application,close_application,set_system_volume,get_system_volume,mute_toggle,"
+    "search_web,search_news,instant_answer,send_notification,set_reminder,"
+    "get_system_info,get_current_datetime,open_path,search_file,read_clipboard,"
+    "write_clipboard,take_screenshot,write_docx_report,get_now_playing,play_spotify,pause_spotify,"
+    "next_track,previous_track"
+)
+DEFAULT_CLOUD_PLANNER_DENY_TOOLS = "shutdown_system,restart_system,kill_process,lock_workstation"
+
 
 # ---------------------------------------------------------------------------
 # Dynamic singleton settings (runtime-modifiable)
@@ -138,6 +162,16 @@ class Settings:
                     cls._instance = super().__new__(cls)
                     cls._instance._initialize()
         return cls._instance
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_csv_set(raw_value: str) -> set[str]:
+        return {
+            token.strip()
+            for token in raw_value.split(",")
+            if token.strip()
+        }
 
     # ------------------------------------------------------------------
 
@@ -178,6 +212,37 @@ class Settings:
             self.host_optimizer_timeout_seconds: float = max(0.1, float(timeout_raw))
         except ValueError:
             self.host_optimizer_timeout_seconds = DEFAULT_HOST_OPTIMIZER_TIMEOUT_SECONDS
+
+        standby_tools_raw = os.getenv("JARVIS_STANDBY_SAFE_TOOLS", DEFAULT_STANDBY_SAFE_TOOLS)
+        self.standby_safe_tools: set[str] = self._parse_csv_set(standby_tools_raw)
+
+        cloud_planner_tools_raw = os.getenv("JARVIS_CLOUD_PLANNER_TOOLS", DEFAULT_CLOUD_PLANNER_TOOLS)
+        self.cloud_planner_tools: set[str] = self._parse_csv_set(cloud_planner_tools_raw)
+
+        cloud_planner_deny_raw = os.getenv("JARVIS_CLOUD_PLANNER_DENY_TOOLS", DEFAULT_CLOUD_PLANNER_DENY_TOOLS)
+        self.cloud_planner_deny_tools: set[str] = self._parse_csv_set(cloud_planner_deny_raw)
+
+        self.cloud_api_key: str = os.getenv("JARVIS_CLOUD_API_KEY", DEFAULT_CLOUD_API_KEY).strip()
+        self.cloud_base_url: str = (
+            os.getenv("JARVIS_CLOUD_BASE_URL", DEFAULT_CLOUD_BASE_URL).strip()
+            or DEFAULT_CLOUD_BASE_URL
+        )
+        self.cloud_model: str = (
+            os.getenv("JARVIS_CLOUD_MODEL", DEFAULT_CLOUD_MODEL).strip()
+            or DEFAULT_CLOUD_MODEL
+        )
+        cloud_timeout_raw = os.getenv(
+            "JARVIS_CLOUD_TIMEOUT_SECONDS",
+            str(DEFAULT_CLOUD_TIMEOUT_SECONDS),
+        )
+        try:
+            self.cloud_timeout_seconds: float = max(5.0, float(cloud_timeout_raw))
+        except ValueError:
+            self.cloud_timeout_seconds = DEFAULT_CLOUD_TIMEOUT_SECONDS
+
+        cloud_enabled_raw = os.getenv("JARVIS_CLOUD_ENABLED", "1").strip().lower()
+        cloud_flag_enabled = cloud_enabled_raw not in {"0", "false", "no", "off"}
+        self.cloud_enabled: bool = bool(DEFAULT_CLOUD_ENABLED and cloud_flag_enabled and self.cloud_api_key)
 
         # Hardware profiles (can be overridden by env later)
         self.performance_profile: HardwareProfile = PERFORMANCE_PROFILE
